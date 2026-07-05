@@ -6,6 +6,6 @@
     "serve": "deno task build && deno run --allow-net --allow-read --allow-env server/main.js"
   },
   "imports": {
-    "@rendly/bedrockjs": "jsr:@rendly/bedrockjs@0.1.2"
+    "@rendly/bedrockjs": "jsr:@rendly/bedrockjs@0.1.3"
   }
 }
