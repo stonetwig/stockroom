@@ -1,0 +1,11 @@
+{
+  "tasks": {
+    "build": "deno bundle --platform browser --minify --sourcemap=linked src/app.js -o public/app.js",
+    "check": "deno check server/main.js src/app.js",
+    "fmt": "deno fmt",
+    "serve": "deno task build && deno run --allow-net --allow-read --allow-env server/main.js"
+  },
+  "imports": {
+    "@rendly/bedrockjs": "jsr:@rendly/bedrockjs@0.1.2"
+  }
+}

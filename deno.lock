@@ -1,0 +1,16 @@
+{
+  "version": "5",
+  "specifiers": {
+    "jsr:@rendly/bedrockjs@0.1.2": "0.1.2"
+  },
+  "jsr": {
+    "@rendly/bedrockjs@0.1.2": {
+      "integrity": "6df362e9bd4891735e2412d26ef13a53a36f57f502cd05dd502dfade7bee7943"
+    }
+  },
+  "workspace": {
+    "dependencies": [
+      "jsr:@rendly/bedrockjs@0.1.2"
+    ]
+  }
+}
