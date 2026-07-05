@@ -1,7 +1,7 @@
 {
   "tasks": {
-    "build": "deno bundle --platform browser --minify --sourcemap=linked src/app.js -o public/app.js",
-    "check": "deno check server/main.js src/app.js",
+    "build": "deno bundle --platform browser --minify --sourcemap=linked src/browser-app.js -o public/app.js",
+    "check": "deno check server/main.js src/app.js src/browser-app.js",
     "fmt": "deno fmt",
     "serve": "deno task build && deno run --allow-net --allow-read --allow-env server/main.js"
   },
