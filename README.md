@@ -63,15 +63,44 @@ BedrockJS synced model `history` (one row per symbol, id = symbol) in Deno KV:
 | `points`                                     | JSON `[[date, close], ...]`, daily, up to five years, nulls dropped |
 | `from`, `to`, `count`, `updatedAt`, `source` | Range and provenance                                                |
 
-`GET /api/history?symbol=X` makes sure the row exists and is fresh (Yahoo is
-asked when it is older than six hours or `&refresh=1` is passed), writes it
-through the sync server so all connected clients get it over SSE, and returns
-`{ row, cursor }`. The browser subscribes with `@rendly/bedrockjs/sync`
-(`src/sync.js`), which persists rows in the `stockroom-sync` IndexedDB database.
+`GET /api/history?symbol=X` returns the cached row and records _demand_ for the
+symbol (a KV key with a 30 day TTL). Upstream (Yahoo) is only contacted for
+symbols that are not cached yet, or when `&refresh=1` is passed and the row is
+older than 15 minutes – never more often than **once per 15 minutes per
+symbol**, no matter who asks. New symbols are limited to 20 per 15 minutes in
+total, and `/api/*` is rate limited per client IP.
+
+A **cron job** (`Deno.cron`, default `30 22 * * 1-5` UTC – weekdays after the US
+close; override with `STOCKROOM_REFRESH_CRON`) refreshes every symbol that has
+been requested by some client in the last 30 days and **deletes** the rest from
+KV, so the cache only holds instruments that are actually in use. Intraday the
+browser lays the live quote over the last bar, so charts stay current between
+refreshes.
+
+The browser subscribes with `@rendly/bedrockjs/sync` (`src/sync.js`), which
+persists rows in the `stockroom-sync` IndexedDB database. **Clients can only
+read**: the server routes just `GET /sync/history/stream` and `/snapshot`; the
+write route (`POST …/ops`) is refused from the network and only used in-process.
 
 The sync server code under `server/sync/` is vendored from BedrockJS 0.1.4 (see
 `server/sync/README.md` for why). A small wrapper compacts the KV change log so
-only the latest version of each row is kept.
+only the latest version of each row is kept, and pruned rows are stored as slim
+tombstones.
+
+## Security notes
+
+- Static files are resolved from percent-decoded path segments; `..`, hidden
+  files and unknown extensions are refused, so encoded traversal cannot leave
+  `public/`. The `serve` task runs with `--allow-read=public` and a scoped
+  `--allow-env`.
+- Every response carries `X-Content-Type-Options`, `X-Frame-Options`,
+  `Referrer-Policy`, `Permissions-Policy` and COOP/CORP headers; HTML gets a
+  Content-Security-Policy that allows scripts only from the app itself and the
+  Plausible host (the Plausible bootstrap lives in `public/analytics.js` so no
+  inline script is needed). There is no wildcard CORS.
+- Upstream requests time out after 10 s, error messages never echo upstream
+  bodies, and the in-memory quote/search cache is bounded.
+- Import files are validated record by record; malformed entries are skipped.
 
 ## Run locally
 
@@ -79,9 +108,10 @@ only the latest version of each row is kept.
 deno task serve
 ```
 
-Open `http://localhost:8000`. Deno KV is enabled through `"unstable": ["kv"]` in
-`deno.json`; locally it stores data in Deno's cache directory (set
-`STOCKROOM_KV_PATH=/path/to/file.db` to use a specific SQLite file).
+Open `http://localhost:8000`. Deno KV and `Deno.cron` are enabled through
+`"unstable": ["kv", "cron"]` in `deno.json`; locally KV stores data in Deno's
+cache directory (set `STOCKROOM_KV_PATH=/path/to/file.db` to use a specific
+SQLite file – then also grant `--allow-read`/`--allow-write` for that path).
 
 ## Useful tasks
 

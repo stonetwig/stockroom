@@ -156,16 +156,44 @@ svg {
   gap: 12px;
 }
 
-.brand-mark {
-  display: grid;
-  place-items: center;
+.brand-logo {
+  display: block;
   width: 42px;
   height: 42px;
-  border-radius: 8px;
-  background: var(--ink);
-  color: var(--surface);
-  font-weight: 800;
-  font-size: 0.9rem;
+  border-radius: 10px;
+  object-fit: cover;
+  box-shadow: 0 1px 2px rgba(23, 25, 31, 0.18);
+}
+
+router-link.brand-link {
+  display: inline-flex;
+  justify-self: start;
+  min-height: 0;
+  padding: 0;
+  border-radius: 10px;
+  color: var(--ink);
+  font-size: inherit;
+  text-align: left;
+  white-space: normal;
+}
+
+.brand-text {
+  display: grid;
+  gap: 1px;
+}
+
+.brand-title,
+.brand-subtitle {
+  display: block;
+}
+
+router-link.brand-link:hover {
+  background: transparent;
+}
+
+router-link.brand-link:hover .brand-title {
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 .brand-title,

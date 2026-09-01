@@ -96,13 +96,21 @@ class AppRoot extends Component {
     return html`
       <div class="app-shell">
         <header class="topbar">
-          <div class="brand-block">
-            <div class="brand-mark">SR</div>
-            <div>
-              <p class="brand-title">Stockroom</p>
-              <p class="brand-subtitle">portfölj på enheten</p>
-            </div>
-          </div>
+          <router-link class="brand-link" to="/" title="Till översikten">
+            <span class="brand-block">
+              <img
+                class="brand-logo"
+                src="/logo-96.png"
+                width="42"
+                height="42"
+                alt="Stockroom"
+              />
+              <span class="brand-text">
+                <span class="brand-title">Stockroom</span>
+                <span class="brand-subtitle">portfölj på enheten</span>
+              </span>
+            </span>
+          </router-link>
 
           <nav class="nav-tabs">
             <router-link to="/">Översikt</router-link>
@@ -2519,10 +2527,14 @@ class SettingsPage extends Component {
     this.busy = true;
     try {
       const data = JSON.parse(await file.text());
-      validateImport(data);
-      await replaceAllData(data);
+      const clean = validateImport(data);
+      await replaceAllData(clean);
       await hydrateState();
-      this.message = "Importerade lokal portföljdata.";
+      this.message = `Importerade ${
+        countLabel(clean.lots.length, "köp", "köp")
+      } och ${countLabel(clean.sales.length, "försäljning", "försäljningar")}${
+        clean.skipped ? ` · ${clean.skipped} ogiltiga poster hoppades över` : ""
+      }.`;
     } catch (error) {
       this.message = error.message;
     } finally {
@@ -3669,8 +3681,13 @@ function shortDate(value) {
   }).format(new Date(value));
 }
 
+/**
+ * Validate an import file and return only well-formed records. Anything that
+ * would break the ledger (missing symbol, non-positive quantity, bad dates,
+ * unknown shapes) is dropped instead of being written to IndexedDB.
+ */
 function validateImport(data) {
-  if (!data || typeof data !== "object") {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
     throw new Error("Importfilen är inte giltig JSON.");
   }
   if (!Array.isArray(data.lots)) {
@@ -3682,4 +3699,135 @@ function validateImport(data) {
   if (!Array.isArray(data.watchlist)) {
     throw new Error("Importfilen saknar bevakningslista.");
   }
+
+  const lots = data.lots.map((lot) => sanitizeTrade(lot, "purchasedAt"));
+  const sales = (data.sales ?? []).map((sale) => sanitizeTrade(sale, "soldAt"));
+  const watchlist = data.watchlist.map(sanitizeWatchItem);
+  const quotes = Object.values(
+    data.quotes && typeof data.quotes === "object" ? data.quotes : {},
+  ).map(sanitizeQuote);
+  const settings = {};
+  const rawSettings = data.settings && typeof data.settings === "object"
+    ? data.settings
+    : {};
+  if (
+    VIEW_CURRENCIES.includes(normalizeCurrency(rawSettings.displayCurrency))
+  ) {
+    settings.displayCurrency = normalizeCurrency(rawSettings.displayCurrency);
+  }
+  if (isIsoDateTime(rawSettings.lastRefresh)) {
+    settings.lastRefresh = rawSettings.lastRefresh;
+  }
+
+  const kept = (items) => items.filter(Boolean);
+  const skipped = [lots, sales, watchlist, quotes]
+    .reduce((total, items) => total + items.filter((item) => !item).length, 0);
+
+  return {
+    lots: dedupeById(kept(lots)),
+    sales: dedupeById(kept(sales)),
+    watchlist: kept(watchlist),
+    quotes: kept(quotes),
+    settings,
+    skipped,
+  };
+}
+
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+function sanitizeTrade(record, dateField) {
+  if (!record || typeof record !== "object") return null;
+  const symbol = cleanSymbol(record.symbol);
+  const quantity = roundQuantity(Number(record.quantity));
+  const price = Number(record.price);
+  const date = String(record[dateField] ?? "");
+  if (
+    !symbol || !(quantity > 0) || !Number.isFinite(price) || price < 0 ||
+    !ISO_DATE.test(date) || Number.isNaN(Date.parse(date))
+  ) {
+    return null;
+  }
+
+  const currency = normalizeCurrency(record.currency) || BASE_CURRENCY;
+  const fxRate = Number(record.fxRate);
+  const fees = Number(record.fees);
+  const now = new Date().toISOString();
+  return {
+    id: typeof record.id === "string" && record.id.length > 0 &&
+        record.id.length <= 64
+      ? record.id
+      : crypto.randomUUID(),
+    symbol,
+    quantity,
+    price,
+    currency: currency.slice(0, 8),
+    fxRate: currency === BASE_CURRENCY
+      ? 1
+      : Number.isFinite(fxRate) && fxRate > 0
+      ? fxRate
+      : 1,
+    [dateField]: date,
+    fees: Number.isFinite(fees) && fees > 0 ? fees : 0,
+    note: typeof record.note === "string" ? record.note.slice(0, 500) : "",
+    createdAt: isIsoDateTime(record.createdAt) ? record.createdAt : now,
+    updatedAt: isIsoDateTime(record.updatedAt) ? record.updatedAt : now,
+  };
+}
+
+function sanitizeWatchItem(record) {
+  const symbol = cleanSymbol(record?.symbol);
+  if (!symbol) return null;
+  return {
+    symbol,
+    addedAt: isIsoDateTime(record.addedAt)
+      ? record.addedAt
+      : new Date().toISOString(),
+  };
+}
+
+function sanitizeQuote(record) {
+  if (!record || typeof record !== "object") return null;
+  const symbol = cleanSymbol(record.symbol);
+  const price = Number(record.price);
+  if (!symbol || !Number.isFinite(price) || price <= 0) return null;
+  const numberOr = (value) => Number.isFinite(value) ? value : undefined;
+  return {
+    symbol,
+    name: typeof record.name === "string" ? record.name.slice(0, 120) : symbol,
+    price,
+    previousClose: numberOr(record.previousClose),
+    change: numberOr(record.change),
+    changePercent: numberOr(record.changePercent),
+    currency: normalizeCurrency(record.currency).slice(0, 8) || BASE_CURRENCY,
+    rawCurrency: typeof record.rawCurrency === "string"
+      ? record.rawCurrency.slice(0, 8)
+      : undefined,
+    exchange: typeof record.exchange === "string"
+      ? record.exchange.slice(0, 80)
+      : "",
+    marketTime: isIsoDateTime(record.marketTime) ? record.marketTime : "",
+    updatedAt: isIsoDateTime(record.updatedAt)
+      ? record.updatedAt
+      : new Date().toISOString(),
+  };
+}
+
+/** Same rules as the server: uppercase ticker characters only. */
+function cleanSymbol(value) {
+  const symbol = normalizeSymbol(value);
+  return /^[A-Z0-9.^=_-]{1,24}$/.test(symbol) ? symbol : "";
+}
+
+function isIsoDateTime(value) {
+  return typeof value === "string" && value.length <= 40 &&
+    !Number.isNaN(Date.parse(value));
+}
+
+function dedupeById(records) {
+  const seen = new Set();
+  return records.filter((record) => {
+    if (seen.has(record.id)) return false;
+    seen.add(record.id);
+    return true;
+  });
 }

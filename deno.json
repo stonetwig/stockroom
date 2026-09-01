@@ -1,12 +1,13 @@
 {
   "unstable": [
-    "kv"
+    "kv",
+    "cron"
   ],
   "tasks": {
     "build": "deno bundle --platform browser --minify --sourcemap=linked src/browser-app.js -o public/app.js",
     "check": "deno check server/main.js src/app.js src/browser-app.js src/sync.js",
     "fmt": "deno fmt",
-    "serve": "deno task build && deno run --allow-net --allow-read --allow-env server/main.js"
+    "serve": "deno task build && deno run --allow-net --allow-read=public --allow-env=PORT,STOCKROOM_KV_PATH,STOCKROOM_REFRESH_CRON server/main.js"
   },
   "imports": {
     "@rendly/bedrockjs": "jsr:@rendly/bedrockjs@0.1.4"

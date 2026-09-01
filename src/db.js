@@ -23,9 +23,15 @@ export async function loadLocalData() {
     ]);
 
   return {
-    lots: lots.sort((a, b) => b.purchasedAt.localeCompare(a.purchasedAt)),
-    sales: sales.sort((a, b) => b.soldAt.localeCompare(a.soldAt)),
-    watchlist: watchlist.sort((a, b) => a.symbol.localeCompare(b.symbol)),
+    lots: lots.sort((a, b) =>
+      String(b.purchasedAt ?? "").localeCompare(String(a.purchasedAt ?? ""))
+    ),
+    sales: sales.sort((a, b) =>
+      String(b.soldAt ?? "").localeCompare(String(a.soldAt ?? ""))
+    ),
+    watchlist: watchlist.sort((a, b) =>
+      String(a.symbol ?? "").localeCompare(String(b.symbol ?? ""))
+    ),
     quotes: Object.fromEntries(quotes.map((quote) => [quote.symbol, quote])),
     histories: Object.fromEntries(
       histories.map((history) => [history.symbol, history]),
