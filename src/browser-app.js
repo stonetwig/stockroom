@@ -3,56 +3,82 @@ import {
   createRouter,
   html,
   keyed,
+  navigate,
+  reactive,
   RouterLink,
   RouterOutlet,
 } from "@rendly/bedrockjs";
-import { reactive } from "@rendly/bedrockjs";
 import {
   clearAllLocalData,
   loadLocalData,
   removeLot,
+  removeSale,
   removeWatchSymbol,
   replaceAllData,
-  saveHistory,
   saveLot,
   saveQuote,
+  saveSale,
   saveSetting,
   saveWatchSymbol,
 } from "./db.js";
+import { fetchQuotes, normalizeSymbol, searchSymbols } from "./market.js";
 import {
-  fetchHistory,
-  fetchQuotes,
-  normalizeSymbol,
-  searchSymbols,
-} from "./market.js";
+  ensureHistory,
+  History,
+  historySeries,
+  pointsInRange,
+  withLiveQuote,
+} from "./sync.js";
 import {
+  availableToSell,
+  BASE_CURRENCY,
+  buildLedger,
   buildPositions,
-  convertToSek,
-  DISPLAY_CURRENCY,
+  convertFromSek,
   formatCurrency,
+  formatDate,
   formatNumber,
   formatPercent,
+  formatShares,
+  formatSignedCurrency,
+  minorUnit,
+  normalizeCurrency,
+  previewSale,
+  QUANTITY_EPSILON,
+  roundQuantity,
   sparklinePath,
   summarizePortfolio,
   toneClass,
+  TRADE_CURRENCIES,
+  tradeAmount,
+  tradeCurrency,
+  tradeFxRate,
+  tradeUnitCost,
+  VIEW_CURRENCIES,
 } from "./math.js";
 
 const state = reactive({
   ready: false,
   lots: [],
+  sales: [],
   watchlist: [],
   quotes: {},
   fxRates: {},
-  histories: {},
   settings: {
     refreshMinutes: 5,
     lastRefresh: "",
+    displayCurrency: BASE_CURRENCY,
   },
   refreshing: false,
   error: "",
   notice: "",
   searchResults: [],
   searchLoading: false,
+  // { symbol } while the sell dialog is open, otherwise null.
+  sellRequest: null,
+  // Per symbol: { status: "loading" | "ready" | "error", error, at }. The
+  // series themselves live in the server-synced `History` model.
+  historyStatus: {},
 });
 
 RouterLink.register();
@@ -66,6 +92,7 @@ class AppRoot extends Component {
   };
 
   render() {
+    const current = displayCurrency();
     return html`
       <div class="app-shell">
         <header class="topbar">
@@ -79,18 +106,41 @@ class AppRoot extends Component {
 
           <nav class="nav-tabs">
             <router-link to="/">Översikt</router-link>
-            <router-link to="/lots">Köp</router-link>
+            <router-link to="/holdings">Innehav</router-link>
+            <router-link to="/transactions">Transaktioner</router-link>
             <router-link to="/research">Sök</router-link>
             <router-link to="/settings">Inställningar</router-link>
           </nav>
 
-          <button
-            class="refresh-button"
-            on-click="${this.refresh}"
-            disabled="${state.refreshing}"
-          >
-            ${state.refreshing ? "Uppdaterar" : "Uppdatera"}
-          </button>
+          <div class="topbar-actions">
+            <div class="segmented" role="group" aria-label="Visningsvaluta">
+              ${VIEW_CURRENCIES.map((currency) =>
+                keyed(
+                  currency,
+                  html`
+                    <button
+                      type="button"
+                      class="${`segment ${
+                        current === currency ? "active" : ""
+                      }`}"
+                      aria-pressed="${current === currency}"
+                      title="${`Visa portföljen i ${currency}`}"
+                      on-click="${() => setDisplayCurrency(currency)}"
+                    >
+                      ${currency}
+                    </button>
+                  `,
+                )
+              )}
+            </div>
+            <button
+              class="refresh-button"
+              on-click="${this.refresh}"
+              disabled="${state.refreshing}"
+            >
+              ${state.refreshing ? "Uppdaterar" : "Uppdatera"}
+            </button>
+          </div>
         </header>
 
         ${state.error
@@ -118,6 +168,12 @@ class AppRoot extends Component {
               <section class="loading-panel">Laddar lokal portfölj...</section>
             `}
         </main>
+
+        ${state.sellRequest
+          ? html`
+            <sell-dialog></sell-dialog>
+          `
+          : ""}
       </div>
     `;
   }
@@ -130,38 +186,62 @@ class DashboardPage extends Component {
     const positions = getPositions();
     const summary = summarizePortfolio(positions);
     const holdings = positions.filter((position) => position.isHolding);
+    const realizedPositions = positions
+      .filter((position) => position.sellCount > 0)
+      .sort((a, b) => b.realized - a.realized);
 
     return html`
       <section class="dashboard-grid">
         <div class="summary-band">
           <article class="metric primary-metric">
             <span class="metric-label">Portföljvärde</span>
-            <strong>${formatCurrency(summary.totalValue)}</strong>
+            <strong>${money(summary.totalValue)}</strong>
             <span class="${`metric-delta ${toneClass(summary.totalGain)}`}">
-              ${formatCurrency(summary.totalGain)} ${formatPercent(
+              ${moneySigned(summary.totalGain)} · ${formatPercent(
                 summary.totalGainPercent,
-              )}
+              )} orealiserat
             </span>
           </article>
           <article class="metric">
             <span class="metric-label">Dagens rörelse</span>
             <strong class="${toneClass(summary.dayChange)}">
-              ${formatCurrency(summary.dayChange)}
+              ${moneySigned(summary.dayChange)}
             </strong>
             <span class="${`metric-delta ${toneClass(summary.dayChange)}`}">
               ${formatPercent(summary.dayChangePercent)}
             </span>
           </article>
           <article class="metric">
-            <span class="metric-label">Anskaffningsvärde</span>
-            <strong>${formatCurrency(summary.totalCost)}</strong>
-            <span class="metric-delta neutral">${summary
-              .holdingsCount} innehav</span>
+            <span class="metric-label">Realiserat</span>
+            <strong class="${toneClass(summary.realized)}">
+              ${moneySigned(summary.realized)}
+            </strong>
+            <span class="${`metric-delta ${
+              summary.salesCount ? toneClass(summary.realized) : "neutral"
+            }`}">
+              ${summary.salesCount
+                ? `${formatPercent(summary.realizedPercent)} · ${
+                  countLabel(summary.salesCount, "försäljning", "försäljningar")
+                }`
+                : "inga försäljningar ännu"}
+            </span>
           </article>
           <article class="metric">
-            <span class="metric-label">Bevakade</span>
-            <strong>${summary.trackedCount}</strong>
-            <span class="metric-delta neutral">${lastRefreshText()}</span>
+            <span class="metric-label">Anskaffningsvärde</span>
+            <strong>${money(summary.totalCost)}</strong>
+            <span class="metric-delta neutral">${countLabel(
+              summary.holdingsCount,
+              "innehav",
+              "innehav",
+            )}</span>
+          </article>
+          <article class="metric">
+            <span class="metric-label">Totalt resultat</span>
+            <strong class="${toneClass(summary.totalReturn)}">
+              ${moneySigned(summary.totalReturn)}
+            </strong>
+            <span
+              class="metric-delta neutral">realiserat + orealiserat · ${lastRefreshText()}</span>
           </article>
         </div>
 
@@ -170,9 +250,20 @@ class DashboardPage extends Component {
             <div>
               <h2>Innehav</h2>
               <p>${holdings.length
-                ? "Öppna positioner sorterade efter marknadsvärde."
-                : "Inga öppna köp ännu."}</p>
+                ? "Öppna positioner sorterade efter marknadsvärde. Sälj hela eller delar av ett innehav direkt från raden."
+                : "Inga öppna innehav ännu."}</p>
             </div>
+            ${holdings.length
+              ? html`
+                <button
+                  type="button"
+                  class="sell-button"
+                  on-click="${() => openSellDialog()}"
+                >
+                  Sälj innehav
+                </button>
+              `
+              : ""}
           </div>
           ${holdings.length
             ? html`
@@ -188,7 +279,8 @@ class DashboardPage extends Component {
             <div>
               <h1>Lägg till köp</h1>
               <p>
-                Registrera aktiesymbol, datum, antal och anskaffningspris i SEK.
+                Registrera symbol, antal och pris i affärens valuta. Växelkursen
+                på köpdagen hämtas automatiskt.
               </p>
             </div>
           </div>
@@ -225,6 +317,26 @@ class DashboardPage extends Component {
             `
             : emptyState("Utveckling visas när kurserna har laddats.")}
         </section>
+
+        <section class="panel realized-panel">
+          <div class="panel-heading">
+            <div>
+              <h2>Realiserat per innehav</h2>
+              <p>Resultat från försäljningar enligt genomsnittsmetoden.</p>
+            </div>
+            ${realizedPositions.length
+              ? html`
+                <router-link class="panel-link"
+                  to="/transactions">Alla transaktioner</router-link>
+              `
+              : ""}
+          </div>
+          ${realizedPositions.length
+            ? realizedList(realizedPositions)
+            : emptyState(
+              "Här samlas resultatet när du säljer hela eller delar av ett innehav.",
+            )}
+        </section>
       </section>
     `;
   }
@@ -236,6 +348,9 @@ class AddLotForm extends Component {
     symbol: { type: String, default: "" },
     quantity: { type: String, default: "" },
     price: { type: String, default: "" },
+    currency: { type: String, default: BASE_CURRENCY },
+    fxRate: { type: String, default: "1" },
+    fxRateDirty: { type: Boolean, default: false },
     purchasedAt: { type: String, default: today },
     fees: { type: String, default: "0" },
     note: { type: String, default: "" },
@@ -255,13 +370,19 @@ class AddLotForm extends Component {
     const quantity = Number(this.quantity);
     const price = Number(this.price);
     const fees = Number(this.fees || 0);
+    const currency = normalizeCurrency(this.currency) || BASE_CURRENCY;
+    const fxRate = currency === BASE_CURRENCY ? 1 : Number(this.fxRate);
 
     if (!symbol || !Number.isFinite(quantity) || quantity <= 0) {
       this.message = "Ange en aktiesymbol och ett positivt antal aktier.";
       return;
     }
     if (!Number.isFinite(price) || price <= 0) {
-      this.message = "Ange köppriset per aktie.";
+      this.message = `Ange köppriset per aktie i ${currency}.`;
+      return;
+    }
+    if (!Number.isFinite(fxRate) || fxRate <= 0) {
+      this.message = `Ange växelkursen (SEK per ${currency}).`;
       return;
     }
 
@@ -271,14 +392,21 @@ class AddLotForm extends Component {
         symbol,
         quantity,
         price,
+        currency,
+        fxRate,
         purchasedAt: this.purchasedAt || today(),
-        fees: Number.isFinite(fees) ? fees : 0,
+        fees: Number.isFinite(fees) && fees > 0 ? fees : 0,
         note: this.note.trim(),
       });
-      this.message = `Sparade ${formatNumber(quantity, 4)} aktier i ${symbol}.`;
+      this.message = `Sparade ${formatShares(quantity)} ${symbol} à ${
+        formatCurrency(price, currency)
+      }${currency === BASE_CURRENCY ? "" : ` (${money(price * fxRate)})`}.`;
       this.symbol = "";
       this.quantity = "";
       this.price = "";
+      this.currency = BASE_CURRENCY;
+      this.fxRate = "1";
+      this.fxRateDirty = false;
       this.fees = "0";
       this.note = "";
       this.purchasedAt = today();
@@ -313,6 +441,7 @@ class AddLotForm extends Component {
   }
 
   async runTickerSearch(query) {
+    if (!this.symbolInputFocused()) return;
     const token = ++this.lookupToken;
     this.lookupLoading = true;
     this.suggestionOpen = true;
@@ -342,25 +471,23 @@ class AddLotForm extends Component {
     this.suggestions = [];
     this.suggestionOpen = false;
     this.lookupLoading = false;
-    this.busy = true;
-
-    try {
-      const quote = await refreshOneSymbol(symbol);
-      const priceSek = await quotePriceSek(quote);
-      this.price = priceSek.toFixed(2);
-      this.message = `Valde ${symbol} till ${formatCurrency(priceSek)}.`;
-    } catch (error) {
-      this.message = error.message;
-    } finally {
-      this.busy = false;
-    }
+    await this.fillPrice();
   };
 
   closeSuggestions = () => {
+    // Cancel a pending search so it cannot reopen the menu after blur.
+    clearTimeout(this.searchTimer);
+    this.lookupToken += 1;
+    this.lookupLoading = false;
     setTimeout(() => {
       this.suggestionOpen = false;
     }, 120);
   };
+
+  symbolInputFocused() {
+    const input = this.querySelector("input[role='combobox']");
+    return Boolean(input) && document.activeElement === input;
+  }
 
   fillPrice = async () => {
     const symbol = normalizeSymbol(this.symbol);
@@ -371,12 +498,15 @@ class AddLotForm extends Component {
 
     this.busy = true;
     try {
-      const quote = await refreshOneSymbol(symbol);
-      const priceSek = await quotePriceSek(quote);
-      this.price = priceSek.toFixed(2);
-      this.message = `Använder senaste kursen för ${symbol}: ${
-        formatCurrency(priceSek)
-      }.`;
+      const lookup = await lookupTradePrice(
+        symbol,
+        this.purchasedAt || today(),
+      );
+      this.currency = lookup.currency;
+      this.price = priceInputValue(lookup.price);
+      this.fxRate = rateInputValue(lookup.fxRate);
+      this.fxRateDirty = false;
+      this.message = describeLookup(symbol, lookup);
     } catch (error) {
       this.message = error.message;
     } finally {
@@ -384,9 +514,45 @@ class AddLotForm extends Component {
     }
   };
 
+  changeCurrency = (event) => {
+    this.currency = normalizeCurrency(event.target.value) || BASE_CURRENCY;
+    this.fxRateDirty = false;
+    void this.refreshFxRate();
+  };
+
+  changeDate = (event) => {
+    this.purchasedAt = event.target.value;
+    if (!this.fxRateDirty) void this.refreshFxRate();
+  };
+
+  async refreshFxRate() {
+    if (this.currency === BASE_CURRENCY) {
+      this.fxRate = "1";
+      return;
+    }
+    try {
+      const fx = await fxRateOn(this.currency, this.purchasedAt || today());
+      if (this.fxRateDirty) return;
+      this.fxRate = rateInputValue(fx.rate);
+    } catch (error) {
+      this.message = error.message;
+    }
+  }
+
   render() {
+    const currency = normalizeCurrency(this.currency) || BASE_CURRENCY;
+    const foreign = currency !== BASE_CURRENCY;
+    const price = Number(this.price);
+    const quantity = Number(this.quantity);
+    const fxRate = foreign ? Number(this.fxRate) : 1;
+    const fees = Number(this.fees || 0);
+    const totalSek = Number.isFinite(price) && Number.isFinite(quantity) &&
+        Number.isFinite(fxRate) && price > 0 && quantity > 0 && fxRate > 0
+      ? (price * quantity + (Number.isFinite(fees) ? fees : 0)) * fxRate
+      : null;
+
     return html`
-      <form class="lot-form" on-submit="${this.submit}">
+      <form class="lot-form" novalidate on-submit="${this.submit}">
         <label class="ticker-field">
           <span>Aktiesymbol</span>
           <input
@@ -409,26 +575,30 @@ class AddLotForm extends Component {
                   ? html`
                     <div class="ticker-menu-status">Söker...</div>
                   `
-                  : this.suggestions.map((result) =>
-                    keyed(
-                      result.symbol,
-                      html`
-                        <button
-                          type="button"
-                          class="ticker-option"
-                          on-mousedown="${(event) => event.preventDefault()}"
-                          on-click="${() => this.chooseTicker(result)}"
-                        >
-                          <strong>${result.symbol}</strong>
-                          <span>${result.name}</span>
-                          <small>${[result.exchange, result.type].filter(
-                            Boolean,
-                          )
-                            .join(" / ")}</small>
-                        </button>
-                      `,
-                    )
-                  )}
+                  : html`
+                    <div class="ticker-options">
+                      ${this.suggestions.map((result) =>
+                        keyed(
+                          result.symbol,
+                          html`
+                            <button
+                              type="button"
+                              class="ticker-option"
+                              on-mousedown="${(event) =>
+                                event.preventDefault()}"
+                              on-click="${() => this.chooseTicker(result)}"
+                            >
+                              <strong>${result.symbol}</strong>
+                              <span>${result.name}</span>
+                              <small>${[result.exchange, result.type]
+                                .filter(Boolean)
+                                .join(" / ")}</small>
+                            </button>
+                          `,
+                        )
+                      )}
+                    </div>
+                  `}
               </div>
             `
             : ""}
@@ -439,7 +609,7 @@ class AddLotForm extends Component {
           <input
             type="number"
             min="0"
-            step="0.000001"
+            step="any"
             placeholder="12"
             .value="${this.quantity}"
             on-input="${(event) => this.quantity = event.target.value}"
@@ -447,16 +617,17 @@ class AddLotForm extends Component {
         </label>
 
         <label>
-          <span>Pris (SEK)</span>
+          <span>Pris per aktie</span>
           <div class="input-action">
             <input
               type="number"
               min="0"
-              step="0.01"
-              placeholder="1 850.25"
+              step="any"
+              placeholder="0.00"
               .value="${this.price}"
               on-input="${(event) => this.price = event.target.value}"
             />
+            ${currencySelect(currency, this.changeCurrency)}
             <button type="button" on-click="${this.fillPrice}" disabled="${this
               .busy}">
               Hämta
@@ -468,23 +639,43 @@ class AddLotForm extends Component {
           <span>Datum</span>
           <input
             type="date"
+            max="${today()}"
             .value="${this.purchasedAt}"
-            on-input="${(event) => this.purchasedAt = event.target.value}"
+            on-change="${this.changeDate}"
           />
         </label>
 
         <label>
-          <span>Avgifter (SEK)</span>
+          <span>Avgifter (${currency})</span>
           <input
             type="number"
             min="0"
-            step="0.01"
+            step="any"
             .value="${this.fees}"
             on-input="${(event) => this.fees = event.target.value}"
           />
         </label>
 
-        <label class="wide-field">
+        ${foreign
+          ? html`
+            <label>
+              <span>Växelkurs · SEK per ${currency}</span>
+              <input
+                type="number"
+                min="0"
+                step="any"
+                placeholder="10.50"
+                .value="${this.fxRate}"
+                on-input="${(event) => {
+                  this.fxRate = event.target.value;
+                  this.fxRateDirty = true;
+                }}"
+              />
+            </label>
+          `
+          : ""}
+
+        <label class="${foreign ? "" : "wide-field"}">
           <span>Anteckning</span>
           <input
             placeholder="Mäklare, tes, konto"
@@ -495,17 +686,1527 @@ class AddLotForm extends Component {
 
         <div class="form-actions">
           <button class="primary-button" type="submit" disabled="${this.busy}">
-            ${this.busy ? "Sparar" : "Spara köp"}
+            ${this.busy ? "Hämtar" : "Spara köp"}
           </button>
-          ${this.message
-            ? html`
-              <p>${this.message}</p>
-            `
-            : ""}
+          <p>
+            ${this.message ||
+              (totalSek !== null
+                ? `Totalt ${money(totalSek)}${
+                  foreign
+                    ? ` · ${
+                      formatCurrency(
+                        price * quantity + (Number.isFinite(fees) ? fees : 0),
+                        currency,
+                      )
+                    } × ${formatNumber(fxRate, 4)}`
+                    : ""
+                }`
+                : "")}
+          </p>
         </div>
       </form>
     `;
   }
+}
+
+/**
+ * Modal for registering a full or partial sale. Opened by setting
+ * `state.sellRequest`; the element mounts, shows the native <dialog>, and
+ * unmounts again when the request is cleared.
+ */
+class SellDialog extends Component {
+  static tag = "sell-dialog";
+  static properties = {
+    symbol: { type: String, default: "" },
+    quantity: { type: String, default: "" },
+    price: { type: String, default: "" },
+    currency: { type: String, default: BASE_CURRENCY },
+    fxRate: { type: String, default: "1" },
+    fxRateDirty: { type: Boolean, default: false },
+    soldAt: { type: String, default: today },
+    fees: { type: String, default: "0" },
+    note: { type: String, default: "" },
+    message: { type: String, default: "" },
+    busy: { type: Boolean, default: false },
+  };
+
+  #closing = false;
+  #focused = false;
+
+  connectedCallback() {
+    const holdings = getPositions().filter((position) => position.isHolding);
+    const requested = normalizeSymbol(state.sellRequest?.symbol ?? "");
+    const initial = holdings.some((position) => position.symbol === requested)
+      ? requested
+      : holdings[0]?.symbol ?? "";
+    if (initial) this.selectSymbol(initial);
+    super.connectedCallback();
+  }
+
+  selectSymbol(symbol) {
+    this.symbol = normalizeSymbol(symbol);
+    this.quantity = "";
+    this.message = "";
+    this.fxRateDirty = false;
+
+    const position = this.position();
+    const quote = position?.quote;
+    const currency = normalizeCurrency(quote?.currency) || BASE_CURRENCY;
+    this.currency = currency;
+    this.price = quote && Number.isFinite(quote.price) && quote.price > 0
+      ? priceInputValue(quote.price)
+      : "";
+
+    if (currency === BASE_CURRENCY) {
+      this.fxRate = "1";
+    } else if (Number.isFinite(state.fxRates[currency])) {
+      this.fxRate = rateInputValue(state.fxRates[currency]);
+    } else {
+      this.fxRate = "";
+    }
+
+    if (!this.price || !this.fxRate) void this.fetchPrice();
+  }
+
+  position() {
+    if (!this.symbol) return null;
+    return getPositions().find((position) => position.symbol === this.symbol) ??
+      null;
+  }
+
+  available(position = this.position()) {
+    if (!position) return 0;
+    return availableToSell(
+      position.lots,
+      position.sales,
+      this.soldAt || today(),
+    );
+  }
+
+  fractionQuantity(fraction, available = this.available()) {
+    if (available <= 0) return 0;
+    if (fraction >= 1) return available;
+    const raw = available * fraction;
+    return roundQuantity(Number.isInteger(available) ? Math.floor(raw) : raw);
+  }
+
+  setFraction = (fraction) => {
+    const quantity = this.fractionQuantity(fraction);
+    this.quantity = quantity > 0 ? String(quantity) : "";
+    this.message = "";
+  };
+
+  fetchPrice = async () => {
+    if (!this.symbol) return;
+    this.busy = true;
+    try {
+      const lookup = await lookupTradePrice(
+        this.symbol,
+        this.soldAt || today(),
+      );
+      this.currency = lookup.currency;
+      this.price = priceInputValue(lookup.price);
+      this.fxRate = rateInputValue(lookup.fxRate);
+      this.fxRateDirty = false;
+      this.message = describeLookup(this.symbol, lookup);
+    } catch (error) {
+      this.message = error.message;
+    } finally {
+      this.busy = false;
+    }
+  };
+
+  changeCurrency = (event) => {
+    this.currency = normalizeCurrency(event.target.value) || BASE_CURRENCY;
+    this.fxRateDirty = false;
+    void this.refreshFxRate();
+  };
+
+  changeDate = (event) => {
+    this.soldAt = event.target.value;
+    this.message = "";
+    if (!this.fxRateDirty) void this.refreshFxRate();
+  };
+
+  async refreshFxRate() {
+    if (this.currency === BASE_CURRENCY) {
+      this.fxRate = "1";
+      return;
+    }
+    try {
+      const fx = await fxRateOn(this.currency, this.soldAt || today());
+      if (this.fxRateDirty) return;
+      this.fxRate = rateInputValue(fx.rate);
+    } catch (error) {
+      this.message = error.message;
+    }
+  }
+
+  submit = async (event) => {
+    event.preventDefault();
+    const position = this.position();
+    const quantity = roundQuantity(Number(this.quantity));
+    const price = Number(this.price);
+    const fees = Number(this.fees || 0);
+    const soldAt = this.soldAt || today();
+    const currency = normalizeCurrency(this.currency) || BASE_CURRENCY;
+    const fxRate = currency === BASE_CURRENCY ? 1 : Number(this.fxRate);
+
+    if (!position) {
+      this.message = "Välj ett innehav att sälja.";
+      return;
+    }
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      this.message = "Ange hur många aktier du sålde.";
+      return;
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(soldAt)) {
+      this.message = "Ange ett giltigt försäljningsdatum.";
+      return;
+    }
+    const available = this.available(position);
+    if (quantity > available + QUANTITY_EPSILON) {
+      this.message = available > 0
+        ? `Du hade bara ${
+          formatShares(available)
+        } aktier i ${position.symbol} tillgängliga ${formatDate(soldAt)}.`
+        : `Du hade inga aktier i ${position.symbol} att sälja ${
+          formatDate(soldAt)
+        }.`;
+      return;
+    }
+    if (!Number.isFinite(price) || price <= 0) {
+      this.message = `Ange försäljningspriset per aktie i ${currency}.`;
+      return;
+    }
+    if (!Number.isFinite(fxRate) || fxRate <= 0) {
+      this.message = `Ange växelkursen (SEK per ${currency}).`;
+      return;
+    }
+    if (!Number.isFinite(fees) || fees < 0) {
+      this.message = "Avgifter kan inte vara negativa.";
+      return;
+    }
+
+    this.busy = true;
+    try {
+      const { result } = await addSale({
+        symbol: position.symbol,
+        quantity,
+        price,
+        currency,
+        fxRate,
+        fees,
+        soldAt,
+        note: this.note.trim(),
+      });
+      state.notice = `Sålde ${formatShares(quantity)} ${position.symbol} för ${
+        money(result.netProceeds)
+      }. Realiserat resultat ${moneySigned(result.gain)} (${
+        formatPercent(result.gainPercent)
+      }).`;
+      this.close();
+    } catch (error) {
+      this.message = error.message;
+      this.busy = false;
+    }
+  };
+
+  close = () => {
+    this.#closing = true;
+    const dialog = this.querySelector("dialog");
+    if (dialog?.open) dialog.close();
+    closeSellDialog();
+  };
+
+  handleClose = () => {
+    this.#closing = true;
+    closeSellDialog();
+  };
+
+  handleBackdropClick = (event) => {
+    if (event.target === event.currentTarget) this.close();
+  };
+
+  updated() {
+    const dialog = this.querySelector("dialog");
+    if (dialog && !dialog.open && !this.#closing && this.isConnected) {
+      dialog.showModal();
+    }
+    syncSelect(this, "select.sell-symbol", this.symbol);
+
+    if (!this.#focused) {
+      const input = this.querySelector("input[name='quantity']");
+      if (input) {
+        input.focus();
+        this.#focused = true;
+      }
+    }
+  }
+
+  render() {
+    const positions = getPositions();
+    const holdings = positions.filter((position) => position.isHolding);
+    const position = positions.find((item) => item.symbol === this.symbol) ??
+      null;
+
+    return html`
+      <dialog
+        class="sell-dialog"
+        aria-labelledby="sell-dialog-title"
+        on-close="${this.handleClose}"
+        on-click="${this.handleBackdropClick}"
+      >
+        ${position ? this.renderForm(position, holdings) : this.renderEmpty()}
+      </dialog>
+    `;
+  }
+
+  renderEmpty() {
+    return html`
+      <div class="sell-form">
+        <div class="sell-head">
+          <div>
+            <h2 id="sell-dialog-title">Sälj innehav</h2>
+            <p>Du har inga öppna innehav att sälja ännu.</p>
+          </div>
+          <button
+            type="button"
+            class="icon-button"
+            aria-label="Stäng"
+            on-click="${this.close}"
+          >
+            ×
+          </button>
+        </div>
+        ${emptyState(
+          "Registrera ett köp först, sedan kan du sälja hela eller delar av innehavet här.",
+        )}
+      </div>
+    `;
+  }
+
+  renderForm(position, holdings) {
+    const soldAt = this.soldAt || today();
+    const available = this.available(position);
+    const quantity = Number(this.quantity);
+    const price = Number(this.price);
+    const fees = Number(this.fees || 0);
+    const currency = normalizeCurrency(this.currency) || BASE_CURRENCY;
+    const foreign = currency !== BASE_CURRENCY;
+    const fxRate = foreign ? Number(this.fxRate) : 1;
+    const quantityOk = Number.isFinite(quantity) && quantity > 0 &&
+      quantity <= available + QUANTITY_EPSILON;
+    const priceOk = Number.isFinite(price) && price > 0;
+    const fxOk = Number.isFinite(fxRate) && fxRate > 0;
+    const preview = quantityOk && priceOk && fxOk
+      ? previewSale(position.lots, position.sales, {
+        quantity: roundQuantity(quantity),
+        price,
+        currency,
+        fxRate,
+        fees: Number.isFinite(fees) && fees > 0 ? fees : 0,
+        soldAt,
+      })
+      : null;
+    const oversold = Number.isFinite(quantity) && quantity > 0 &&
+      quantity > available + QUANTITY_EPSILON;
+    const sliderStep = Number.isInteger(available) ? 1 : 0.0001;
+    const isToday = soldAt === today();
+    const quote = position.quote;
+    const dayTone = toneClass(quote?.changePercent ?? 0);
+    const quoteCurrency = normalizeCurrency(quote?.currency) || BASE_CURRENCY;
+    const showNative = quote && quoteCurrency !== displayCurrency();
+
+    return html`
+      <form class="sell-form" novalidate on-submit="${this.submit}">
+        <div class="sell-head">
+          <div>
+            <h2 id="sell-dialog-title">Sälj ${position.symbol}</h2>
+            <p>
+              ${position.name} · Registrera en hel eller delvis försäljning.
+              Resultatet räknas i SEK med genomsnittsmetoden.
+            </p>
+          </div>
+          <button
+            type="button"
+            class="icon-button"
+            aria-label="Stäng"
+            on-click="${this.close}"
+          >
+            ×
+          </button>
+        </div>
+
+        ${holdings.length > 1
+          ? html`
+            <label class="sell-symbol-field">
+              <span>Innehav</span>
+              <select
+                class="sell-symbol"
+                on-change="${(event) => this.selectSymbol(event.target.value)}"
+              >
+                ${holdings.map((item) =>
+                  keyed(
+                    item.symbol,
+                    html`
+                      <option value="${item.symbol}">${`${item.symbol} · ${
+                        formatShares(item.shares)
+                      } st · ${money(item.marketValue)}`}</option>
+                    `,
+                  )
+                )}
+              </select>
+            </label>
+          `
+          : ""}
+
+        <div class="sell-facts">
+          <div class="fact">
+            <small>Innehav</small>
+            <strong>${formatShares(position.shares)} st</strong>
+            <span>${money(position.marketValue)}</span>
+          </div>
+          <div class="fact">
+            <small>Snittkurs</small>
+            <strong>${money(position.averageCost)}</strong>
+            <span>inkl. avgifter, i SEK</span>
+          </div>
+          <div class="fact">
+            <small>Kurs nu</small>
+            <strong>${money(position.price)}</strong>
+            <span class="${dayTone}">${showNative
+              ? `${formatCurrency(quote.price, quoteCurrency)} · ${
+                formatPercent(quote?.changePercent ?? 0)
+              }`
+              : `${formatPercent(quote?.changePercent ?? 0)} idag`}</span>
+          </div>
+          <div class="fact">
+            <small>Orealiserat</small>
+            <strong class="${toneClass(position.gain)}">${moneySigned(
+              position.gain,
+            )}</strong>
+            <span class="${toneClass(position.gain)}">${formatPercent(
+              position.gainPercent,
+            )}</span>
+          </div>
+        </div>
+
+        <div class="sell-grid">
+          <div class="quantity-field">
+            <div class="field-heading">
+              <span>Antal att sälja</span>
+              <span class="${oversold ? "negative" : "muted"}">
+                ${available > 0
+                  ? `Tillgängligt ${formatShares(available)} st${
+                    isToday ? "" : ` den ${formatDate(soldAt)}`
+                  }`
+                  : isToday
+                  ? "Inget tillgängligt att sälja"
+                  : `Inget tillgängligt den ${formatDate(soldAt)}`}
+              </span>
+            </div>
+            <div class="quantity-controls">
+              <input
+                name="quantity"
+                type="number"
+                inputmode="decimal"
+                min="0"
+                step="any"
+                placeholder="0"
+                .value="${this.quantity}"
+                on-input="${(event) => {
+                  this.quantity = event.target.value;
+                  this.message = "";
+                }}"
+              />
+              <div class="chip-row" role="group" aria-label="Snabbval">
+                ${[0.25, 0.5, 0.75, 1].map((fraction) => {
+                  const value = this.fractionQuantity(fraction, available);
+                  const active = value > 0 &&
+                    Math.abs(value - quantity) < QUANTITY_EPSILON;
+                  return keyed(
+                    fraction,
+                    html`
+                      <button
+                        type="button"
+                        class="${`chip ${active ? "active" : ""}`}"
+                        disabled="${available <= 0}"
+                        on-click="${() => this.setFraction(fraction)}"
+                      >
+                        ${fraction >= 1
+                          ? "Allt"
+                          : `${Math.round(fraction * 100)} %`}
+                      </button>
+                    `,
+                  );
+                })}
+              </div>
+            </div>
+            <input
+              class="quantity-slider"
+              type="range"
+              aria-label="Antal att sälja"
+              min="0"
+              max="${available}"
+              step="${sliderStep}"
+              disabled="${available <= 0}"
+              .value="${Number.isFinite(quantity) && quantity > 0
+                ? String(Math.min(quantity, available))
+                : "0"}"
+              on-input="${(event) => {
+                this.quantity = event.target.value;
+                this.message = "";
+              }}"
+            />
+          </div>
+
+          <label>
+            <span>Pris per aktie</span>
+            <div class="input-action">
+              <input
+                type="number"
+                min="0"
+                step="any"
+                placeholder="0.00"
+                .value="${this.price}"
+                on-input="${(event) => this.price = event.target.value}"
+              />
+              ${currencySelect(currency, this.changeCurrency)}
+              <button
+                type="button"
+                on-click="${this.fetchPrice}"
+                disabled="${this.busy}"
+              >
+                Hämta
+              </button>
+            </div>
+          </label>
+
+          <label>
+            <span>Datum</span>
+            <input
+              type="date"
+              max="${today()}"
+              .value="${this.soldAt}"
+              on-change="${this.changeDate}"
+            />
+          </label>
+
+          <label>
+            <span>Avgifter (${currency})</span>
+            <input
+              type="number"
+              min="0"
+              step="any"
+              .value="${this.fees}"
+              on-input="${(event) => this.fees = event.target.value}"
+            />
+          </label>
+
+          ${foreign
+            ? html`
+              <label>
+                <span>Växelkurs · SEK per ${currency}</span>
+                <input
+                  type="number"
+                  min="0"
+                  step="any"
+                  placeholder="10.50"
+                  .value="${this.fxRate}"
+                  on-input="${(event) => {
+                    this.fxRate = event.target.value;
+                    this.fxRateDirty = true;
+                  }}"
+                />
+              </label>
+            `
+            : ""}
+
+          <label class="${foreign ? "wide-field" : ""}">
+            <span>Anteckning</span>
+            <input
+              placeholder="Mäklare, anledning, konto"
+              .value="${this.note}"
+              on-input="${(event) => this.note = event.target.value}"
+            />
+          </label>
+        </div>
+
+        <div class="${`sell-preview ${
+          preview ? toneClass(preview.gain) : "idle"
+        }`}">
+          <div>
+            <small>Erhållet netto</small>
+            <strong>${preview ? money(preview.netProceeds) : "–"}</strong>
+            <span>${preview
+              ? foreign
+                ? `${
+                  formatCurrency(
+                    roundQuantity(quantity) * price -
+                      (Number.isFinite(fees) ? fees : 0),
+                    currency,
+                  )
+                } × ${formatNumber(fxRate, 4)}`
+                : fees > 0
+                ? `efter ${money(fees)} i avgifter`
+                : "pris × antal − avgifter"
+              : "pris × antal − avgifter"}</span>
+          </div>
+          <div>
+            <small>Anskaffning</small>
+            <strong>${preview ? money(preview.costBasis) : "–"}</strong>
+            <span>${preview
+              ? `${formatShares(roundQuantity(quantity))} × ${
+                money(preview.averageCost)
+              } snitt`
+              : "genomsnittsmetoden"}</span>
+          </div>
+          <div>
+            <small>Realiserat resultat</small>
+            <strong class="${preview ? toneClass(preview.gain) : ""}">${preview
+              ? moneySigned(preview.gain)
+              : "–"}</strong>
+            <span class="${preview ? toneClass(preview.gain) : ""}">${preview
+              ? formatPercent(preview.gainPercent)
+              : "fyll i antal och pris"}</span>
+          </div>
+          <div>
+            <small>Kvar efteråt</small>
+            <strong>${preview
+              ? `${formatShares(preview.remainingShares)} st`
+              : `${formatShares(position.shares)} st`}</strong>
+            <span>${preview
+              ? preview.remainingShares > QUANTITY_EPSILON
+                ? money(preview.remainingShares * position.price)
+                : "positionen avslutas"
+              : "oförändrat"}</span>
+          </div>
+        </div>
+
+        <div class="sell-actions">
+          <p class="${`inline-message ${oversold ? "negative" : ""}`}">
+            ${this.message ||
+              (oversold
+                ? `Du kan sälja högst ${formatShares(available)} st.`
+                : "")}
+          </p>
+          <div class="button-row">
+            <button type="button" on-click="${this.close}">Avbryt</button>
+            <button
+              type="submit"
+              class="sell-button"
+              disabled="${this.busy || !quantityOk || !priceOk || !fxOk}"
+            >
+              ${this.busy
+                ? "Sparar"
+                : quantityOk
+                ? `Sälj ${formatShares(roundQuantity(quantity))} aktier`
+                : "Sälj"}
+            </button>
+          </div>
+        </div>
+      </form>
+    `;
+  }
+}
+
+const CHART_RANGES = [
+  { value: "1mo", label: "1M" },
+  { value: "3mo", label: "3M" },
+  { value: "6mo", label: "6M" },
+  { value: "1y", label: "1Å" },
+  { value: "2y", label: "2Å" },
+  { value: "5y", label: "5Å" },
+];
+
+const CHART = {
+  width: 760,
+  height: 320,
+  left: 62,
+  right: 18,
+  top: 18,
+  bottom: 30,
+};
+
+/**
+ * Holdings page: filterable list on the left, a large price chart with every
+ * buy and sell plotted on it to the right, plus a per-trade timing list.
+ */
+class HoldingsPage extends Component {
+  static tag = "holdings-page";
+  static properties = {
+    filter: { type: String, default: "" },
+    scope: { type: String, default: "holdings" },
+    range: { type: String, default: "6mo" },
+    hoverIndex: { type: Number, default: -1 },
+  };
+
+  #symbol = "";
+  #model = null;
+
+  select = (symbol) => {
+    this.hoverIndex = -1;
+    navigate(`/holdings/${encodeURIComponent(symbol)}`);
+  };
+
+  setRange = (range) => {
+    this.range = range;
+    this.hoverIndex = -1;
+  };
+
+  handleChartMove = (event) => {
+    const model = this.#model;
+    if (!model) return;
+    const svg = event.currentTarget.ownerSVGElement ?? event.currentTarget;
+    if (!svg) return;
+    const box = svg.getBoundingClientRect();
+    if (!box.width) return;
+    const viewX = (event.clientX - box.left) / box.width * CHART.width;
+    const plotWidth = CHART.width - CHART.left - CHART.right;
+    const ratio = Math.min(
+      1,
+      Math.max(0, (viewX - CHART.left) / plotWidth),
+    );
+    this.hoverIndex = Math.round(ratio * (model.points.length - 1));
+  };
+
+  handleChartLeave = () => {
+    this.hoverIndex = -1;
+  };
+
+  updated() {
+    if (this.#symbol) void ensureChart(this.#symbol, this.range);
+  }
+
+  selectedSymbol(positions) {
+    const requested = normalizeSymbol(this.routeData?.params?.symbol ?? "");
+    if (requested && positions.some((item) => item.symbol === requested)) {
+      return requested;
+    }
+    return positions.find((item) => item.isHolding)?.symbol ??
+      positions.find((item) => item.hasTrades)?.symbol ??
+      positions[0]?.symbol ?? "";
+  }
+
+  render() {
+    const positions = getPositions();
+    const holdings = positions.filter((item) => item.isHolding);
+    const closed = positions.filter((item) => item.isClosed);
+    const scoped = this.scope === "holdings"
+      ? holdings
+      : this.scope === "closed"
+      ? closed
+      : positions;
+    const needle = this.filter.trim().toUpperCase();
+    const listed = scoped.filter((item) =>
+      !needle || item.symbol.includes(needle) ||
+      String(item.name ?? "").toUpperCase().includes(needle)
+    );
+    const symbol = this.selectedSymbol(positions);
+    this.#symbol = symbol;
+    const position = positions.find((item) => item.symbol === symbol) ?? null;
+
+    return html`
+      <section class="holdings-grid">
+        <aside class="panel holdings-list-panel">
+          <div class="panel-heading">
+            <div>
+              <h1>Innehav</h1>
+              <p>Välj ett innehav för att se kursen med dina köp och försäljningar.</p>
+            </div>
+          </div>
+          <input
+            class="filter-input"
+            type="search"
+            placeholder="Filtrera på symbol eller namn"
+            .value="${this.filter}"
+            on-input="${(event) => this.filter = event.target.value}"
+          />
+          <div class="chip-row scope-chips" role="group" aria-label="Urval">
+            ${scopeChip(this, "holdings", `Öppna · ${holdings.length}`)}
+            ${scopeChip(this, "closed", `Avslutade · ${closed.length}`)}
+            ${scopeChip(this, "all", `Alla · ${positions.length}`)}
+          </div>
+          ${listed.length
+            ? html`
+              <div class="holding-list">
+                ${listed.map((item) =>
+                  keyed(item.symbol, holdingListItem(item, symbol, this.select))
+                )}
+              </div>
+            `
+            : emptyState(
+              positions.length
+                ? "Inget innehav matchar filtret."
+                : "Lägg till ett köp på översikten för att se det här.",
+            )}
+        </aside>
+
+        <section class="panel holding-detail">
+          ${position ? this.renderDetail(position) : emptyState(
+            "Välj ett innehav i listan.",
+          )}
+        </section>
+      </section>
+    `;
+  }
+
+  renderDetail(position) {
+    const quote = position.quote;
+    const chartCurrency = normalizeCurrency(quote?.currency) || BASE_CURRENCY;
+    const showNative = chartCurrency !== displayCurrency();
+    const chart = chartFor(position.symbol, this.range);
+    const model = chartModel(position, chart.history, this.range);
+    this.#model = model;
+    const hover = model && this.hoverIndex >= 0 &&
+        this.hoverIndex < model.points.length
+      ? this.hoverIndex
+      : -1;
+    const trades = tradeTimeline(position, chartCurrency);
+    const nativeAverage = model?.nativeAverage ??
+      nativeAverageCost(position, chartCurrency);
+
+    return html`
+      <div class="detail-head">
+        <div>
+          <h2>${position.symbol}</h2>
+          <p>
+            ${[
+              position.name,
+              quote?.exchange,
+              `noterad i ${chartCurrency}`,
+            ].filter(Boolean).join(" · ")}
+          </p>
+        </div>
+        ${position.isHolding
+          ? html`
+            <button
+              type="button"
+              class="sell-button"
+              on-click="${() => openSellDialog(position.symbol)}"
+            >
+              Sälj ${position.symbol}
+            </button>
+          `
+          : position.isClosed
+          ? html`
+            <span class="pill closed">Avslutad position</span>
+          `
+          : html`
+            <span class="pill closed">Bevakad</span>
+          `}
+      </div>
+
+      <div class="detail-stats">
+        <div class="fact">
+          <small>Kurs</small>
+          <strong>${money(position.price)}</strong>
+          <span class="${toneClass(
+            quote?.changePercent ?? 0,
+          )}">${showNative && quote
+            ? `${formatCurrency(quote.price, chartCurrency)} · ${
+              formatPercent(quote?.changePercent ?? 0)
+            }`
+            : `${formatPercent(quote?.changePercent ?? 0)} idag`}</span>
+        </div>
+        <div class="fact">
+          <small>Innehav</small>
+          <strong>${formatShares(position.shares)} st</strong>
+          <span>${money(position.marketValue)}</span>
+        </div>
+        <div class="fact">
+          <small>Snittkurs</small>
+          <strong>${position.isHolding
+            ? money(position.averageCost)
+            : "–"}</strong>
+          <span>${position.isHolding && showNative && nativeAverage
+            ? `${formatCurrency(nativeAverage, chartCurrency)} · inkl. avgifter`
+            : "inkl. avgifter"}</span>
+        </div>
+        <div class="fact">
+          <small>Orealiserat</small>
+          <strong class="${toneClass(position.gain)}">${moneySigned(
+            position.gain,
+          )}</strong>
+          <span class="${toneClass(position.gain)}">${position.isHolding
+            ? formatPercent(position.gainPercent)
+            : "ingen öppen position"}</span>
+        </div>
+        <div class="fact">
+          <small>Realiserat</small>
+          <strong class="${toneClass(position.realized)}">${moneySigned(
+            position.realized,
+          )}</strong>
+          <span class="${position.sellCount
+            ? toneClass(position.realized)
+            : "muted"}">${position
+              .sellCount
+            ? `${formatPercent(position.realizedPercent)} · ${
+              countLabel(position.sellCount, "försäljning", "försäljningar")
+            }`
+            : "inga försäljningar"}</span>
+        </div>
+      </div>
+
+      <div class="chart-toolbar">
+        <div class="chip-row" role="group" aria-label="Tidsintervall">
+          ${CHART_RANGES.map((item) =>
+            keyed(
+              item.value,
+              html`
+                <button
+                  type="button"
+                  class="${`chip ${this.range === item.value ? "active" : ""}`}"
+                  on-click="${() => this.setRange(item.value)}"
+                >
+                  ${item.label}
+                </button>
+              `,
+            )
+          )}
+        </div>
+        <div class="chart-legend">
+          <span><i class="legend-buy"></i> Köp</span>
+          <span><i class="legend-sell"></i> Sälj</span>
+          ${position.isHolding
+            ? html`
+              <span><i class="legend-avg"></i> Snittkurs</span>
+            `
+            : ""}
+          <span><i class="legend-line"></i> Stängningskurs (${chartCurrency})</span>
+        </div>
+      </div>
+
+      ${model
+        ? priceChart(
+          model,
+          hover,
+          position,
+          this.handleChartMove,
+          this.handleChartLeave,
+        )
+        : chart.status === "error"
+        ? emptyState(`Kunde inte hämta kurshistorik: ${chart.error}`)
+        : emptyState(
+          chart.status === "loading"
+            ? "Hämtar kurshistorik..."
+            : "Ingen kurshistorik tillgänglig för intervallet.",
+        )}
+
+      ${model
+        ? html`
+          <p class="chart-caption">
+            <span class="${model.tone}">${formatPercent(
+              model.changePercent,
+            )}</span>
+            under perioden · högst ${formatCurrency(
+              model.high,
+              model.currency,
+            )} ·
+            lägst ${formatCurrency(model.low, model.currency)}${model.outside
+              ? ` · ${
+                countLabel(model.outside, "affär", "affärer")
+              } ligger före intervallet, välj ett längre`
+              : ""}${chart.status === "loading" ? " · uppdaterar..." : ""}
+          </p>
+        `
+        : ""}
+
+      <div class="detail-section-heading">
+        <h3>Affärer i ${position.symbol}</h3>
+        <p>Kursen sedan varje affär – stigande kurs efter köp och fallande efter sälj är bra tajming.</p>
+      </div>
+      ${trades.length
+        ? html`
+          <div class="timing-list">
+            ${trades.map((trade) => keyed(trade.id, timingRow(trade, model)))}
+          </div>
+        `
+        : emptyState("Inga affärer registrerade för det här innehavet.")}
+    `;
+  }
+}
+
+function scopeChip(page, value, label) {
+  return html`
+    <button
+      type="button"
+      class="${`chip ${page.scope === value ? "active" : ""}`}"
+      on-click="${() => page.scope = value}"
+    >
+      ${label}
+    </button>
+  `;
+}
+
+function holdingListItem(position, selected, onSelect) {
+  const quote = position.quote;
+  return html`
+    <button
+      type="button"
+      class="${`holding-item ${position.symbol === selected ? "active" : ""}`}"
+      aria-pressed="${position.symbol === selected}"
+      on-click="${() => onSelect(position.symbol)}"
+    >
+      <strong>${position.symbol}</strong>
+      <b>${position.isHolding
+        ? money(position.marketValue)
+        : money(position.price)}</b>
+      <span>${position.name}</span>
+      <small class="${position.isHolding
+        ? toneClass(position.gain)
+        : toneClass(quote?.changePercent ?? 0)}">${position.isHolding
+        ? `${formatShares(position.shares)} st · ${
+          formatPercent(position.gainPercent)
+        }`
+        : position.isClosed
+        ? `avslutad · ${moneySigned(position.realized)}`
+        : `${formatPercent(quote?.changePercent ?? 0)} idag`}</small>
+    </button>
+  `;
+}
+
+function chartFor(symbol, range) {
+  const status = state.historyStatus[symbol];
+  const history = recentHistory(symbol, range);
+  return {
+    status: status?.status ?? (history ? "ready" : "loading"),
+    error: status?.error ?? "",
+    history,
+  };
+}
+
+function ensureChart(symbol, _range) {
+  return loadHistory(symbol);
+}
+
+/** Every trade for a symbol with its price expressed in the chart currency. */
+function tradeTimeline(position, chartCurrency) {
+  const quote = position.quote;
+  const currentNative = quote && Number.isFinite(quote.price)
+    ? quote.price
+    : null;
+
+  const toNative = (record) => {
+    const currency = tradeCurrency(record);
+    if (currency === chartCurrency) {
+      return { price: Number(record.price) || 0, exact: true };
+    }
+    const converted = convertFromSek(
+      tradeUnitCost(record),
+      chartCurrency,
+      state.fxRates,
+    );
+    return {
+      price: Number.isFinite(converted) ? converted : null,
+      exact: false,
+    };
+  };
+
+  const entries = [
+    ...position.lots.map((lot) => ({
+      id: lot.id,
+      type: "buy",
+      date: lot.purchasedAt ?? "",
+      createdAt: lot.createdAt ?? "",
+      record: lot,
+      result: null,
+    })),
+    ...position.sales.map((sale) => ({
+      id: sale.id,
+      type: "sell",
+      date: sale.soldAt ?? "",
+      createdAt: sale.createdAt ?? "",
+      record: sale,
+      result: position.ledger.saleResults.get(sale.id) ?? null,
+    })),
+  ];
+
+  return entries
+    .map((entry) => {
+      const native = toNative(entry.record);
+      const since = currentNative && native.price > 0
+        ? (currentNative - native.price) / native.price * 100
+        : null;
+      return { ...entry, native, since, chartCurrency };
+    })
+    .sort((a, b) =>
+      b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)
+    );
+}
+
+/**
+ * Average cost expressed in the chart (quote) currency – exact when every
+ * trade was made in that currency, otherwise converted at today's rate.
+ */
+function nativeAverageCost(position, chartCurrency) {
+  if (!position.isHolding) return null;
+  let approximate = false;
+
+  const convert = (record) => {
+    const currency = tradeCurrency(record);
+    if (currency === chartCurrency) {
+      return {
+        ...record,
+        price: Number(record.price) || 0,
+        fees: Number(record.fees) || 0,
+        currency: chartCurrency,
+        fxRate: 1,
+      };
+    }
+    approximate = true;
+    const rate = tradeFxRate(record);
+    const price = convertFromSek(
+      (Number(record.price) || 0) * rate,
+      chartCurrency,
+      state.fxRates,
+    );
+    const fees = convertFromSek(
+      (Number(record.fees) || 0) * rate,
+      chartCurrency,
+      state.fxRates,
+    );
+    if (price === null || fees === null) return null;
+    return { ...record, price, fees, currency: chartCurrency, fxRate: 1 };
+  };
+
+  const lots = position.lots.map(convert);
+  const sales = position.sales.map(convert);
+  if (lots.includes(null) || sales.includes(null)) return null;
+
+  const ledger = buildLedger(lots, sales);
+  if (!(ledger.shares > 0)) return null;
+  return ledger.averageCost;
+}
+
+function chartModel(position, history, range) {
+  // Skip data gaps: cached histories may still contain bars Yahoo delivered
+  // as null, and a price is never zero or negative.
+  const points = (history?.points ?? []).filter((point) =>
+    Number.isFinite(point.close) && point.close > 0 && point.date
+  );
+  if (points.length < 2) return null;
+
+  const quote = position.quote;
+  const currency = normalizeCurrency(quote?.currency) || BASE_CURRENCY;
+  const divisor = minorUnit(quote?.rawCurrency ?? quote?.currency).divisor;
+  const closes = points.map((point) => point.close / divisor);
+  const firstDate = points[0].date;
+
+  const timeline = tradeTimeline(position, currency);
+  const markers = [];
+  let outside = 0;
+  for (const trade of timeline) {
+    if (!trade.date || trade.date < firstDate) {
+      outside += 1;
+      continue;
+    }
+    let index = points.findIndex((point) => point.date >= trade.date);
+    if (index === -1) index = points.length - 1;
+    const value = trade.native.price > 0 ? trade.native.price : closes[index];
+    markers.push({ ...trade, index, value, close: closes[index] });
+  }
+  markers.sort((a, b) => a.index - b.index);
+
+  const nativeAverage = nativeAverageCost(position, currency);
+  const values = [
+    ...closes,
+    ...markers.map((marker) => marker.value),
+    ...(nativeAverage ? [nativeAverage] : []),
+  ];
+  let min = Math.min(...values);
+  let max = Math.max(...values);
+  const pad = (max - min || Math.abs(max) * 0.05 || 1) * 0.08;
+  min -= pad;
+  max += pad;
+
+  const plotWidth = CHART.width - CHART.left - CHART.right;
+  const plotHeight = CHART.height - CHART.top - CHART.bottom;
+  const x = (index) => CHART.left + index / (points.length - 1) * plotWidth;
+  const y = (value) =>
+    CHART.top + (1 - (value - min) / (max - min)) * plotHeight;
+  const baseline = CHART.top + plotHeight;
+
+  // Markers on the same day at (almost) the same price would sit on top of
+  // each other – spread them a few pixels sideways so both stay visible.
+  const groups = new Map();
+  for (const marker of markers) {
+    const key = `${marker.index}:${Math.round(y(marker.value) / 10)}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(marker);
+  }
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    group.forEach((marker, position) => {
+      marker.dx = (position - (group.length - 1) / 2) * 11;
+    });
+  }
+
+  const linePath = closes
+    .map((value, index) =>
+      `${index ? "L" : "M"}${x(index).toFixed(1)} ${y(value).toFixed(1)}`
+    )
+    .join(" ");
+  const areaPath = `${linePath} L${x(closes.length - 1).toFixed(1)} ${
+    baseline.toFixed(1)
+  } L${x(0).toFixed(1)} ${baseline.toFixed(1)} Z`;
+
+  const first = closes[0];
+  const last = closes.at(-1);
+  const change = last - first;
+
+  return {
+    points,
+    closes,
+    currency,
+    markers,
+    outside,
+    nativeAverage,
+    min,
+    max,
+    x,
+    y,
+    baseline,
+    plotWidth,
+    plotHeight,
+    linePath,
+    areaPath,
+    yTicks: niceTicks(min, max, 6).map((value) => ({ value, y: y(value) })),
+    xTicks: spreadIndices(points.length, 6).map((index) => ({
+      index,
+      x: x(index),
+      label: axisDate(points[index].date, range),
+    })),
+    first,
+    last,
+    change,
+    changePercent: first ? change / first * 100 : 0,
+    tone: toneClass(change),
+    high: Math.max(...closes),
+    low: Math.min(...closes),
+  };
+}
+
+function priceChart(model, hover, position, onMove, onLeave) {
+  const hovered = hover >= 0
+    ? {
+      index: hover,
+      x: model.x(hover),
+      y: model.y(model.closes[hover]),
+      date: model.points[hover].date,
+      close: model.closes[hover],
+      trades: model.markers.filter((marker) => marker.index === hover),
+    }
+    : null;
+  const tooltipLeft = hovered && hovered.x > CHART.width / 2;
+  const tooltipWidth = 176;
+  const tooltipHeight = 44 + (hovered?.trades.length ?? 0) * 16;
+  const tooltipX = hovered
+    ? tooltipLeft ? hovered.x - tooltipWidth - 12 : hovered.x + 12
+    : 0;
+  const tooltipY = hovered
+    ? Math.max(
+      CHART.top,
+      Math.min(hovered.y - 20, model.baseline - tooltipHeight),
+    )
+    : 0;
+
+  // Note: every nested template below starts with an inner <svg>. BedrockJS
+  // parses each template as HTML, so bare <g>/<line>/<text> roots would be
+  // created as HTML elements and never render inside the chart.
+  return html`
+    <svg
+      class="${`price-chart ${model.tone}`}"
+      viewBox="${`0 0 ${CHART.width} ${CHART.height}`}"
+      role="img"
+      aria-label="${`${position.symbol} kursdiagram med köp och försäljningar`}"
+      on-pointermove="${onMove}"
+      on-pointerdown="${onMove}"
+      on-pointerleave="${onLeave}"
+    >
+      <defs>
+        <linearGradient id="price-chart-fill" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="currentColor" stop-opacity="0.22"></stop>
+          <stop offset="100%" stop-color="currentColor" stop-opacity="0"></stop>
+        </linearGradient>
+      </defs>
+
+      <g class="chart-grid">
+        ${model.yTicks.map((tick) =>
+          keyed(
+            tick.value,
+            html`
+              <svg overflow="visible">
+                <line
+                  x1="${CHART.left}"
+                  x2="${CHART.width - CHART.right}"
+                  y1="${tick.y.toFixed(1)}"
+                  y2="${tick.y.toFixed(1)}"
+                ></line>
+                <text
+                  x="${CHART.left - 8}"
+                  y="${(tick.y + 3.5).toFixed(1)}"
+                  text-anchor="end"
+                >
+                  ${axisPrice(tick.value)}
+                </text>
+              </svg>
+            `,
+          )
+        )}
+      </g>
+
+      <g class="chart-axis">
+        ${model.xTicks.map((tick) =>
+          keyed(
+            tick.index,
+            html`
+              <svg overflow="visible">
+                <text
+                  x="${tick.x.toFixed(1)}"
+                  y="${CHART.height - 9}"
+                  text-anchor="middle"
+                >
+                  ${tick.label}
+                </text>
+              </svg>
+            `,
+          )
+        )}
+      </g>
+
+      <path
+        class="chart-area"
+        d="${model.areaPath}"
+        fill="url(#price-chart-fill)"
+      ></path>
+      <path class="chart-line" d="${model.linePath}"></path>
+
+      ${model.nativeAverage
+        ? html`
+          <svg overflow="visible" class="chart-average">
+            <line
+              x1="${CHART.left}"
+              x2="${CHART.width - CHART.right}"
+              y1="${model.y(model.nativeAverage).toFixed(1)}"
+              y2="${model.y(model.nativeAverage).toFixed(1)}"
+            ></line>
+            <text
+              x="${CHART.width - CHART.right}"
+              y="${(model.y(model.nativeAverage) - 6).toFixed(1)}"
+              text-anchor="end"
+            >
+              snitt ${formatCurrency(model.nativeAverage, model.currency)}
+            </text>
+          </svg>
+        `
+        : ""}
+
+      <g class="chart-markers">
+        ${model.markers.map((marker) =>
+          keyed(marker.id, chartMarker(marker, model))
+        )}
+      </g>
+
+      ${hovered
+        ? html`
+          <svg overflow="visible" class="chart-hover">
+            <line
+              x1="${hovered.x.toFixed(1)}"
+              x2="${hovered.x.toFixed(1)}"
+              y1="${CHART.top}"
+              y2="${model.baseline}"
+            ></line>
+            <circle
+              cx="${hovered.x.toFixed(1)}"
+              cy="${hovered.y.toFixed(1)}"
+              r="4.5"
+            ></circle>
+            <g transform="${`translate(${tooltipX.toFixed(1)} ${
+              tooltipY.toFixed(1)
+            })`}">
+              <rect width="${tooltipWidth}" height="${tooltipHeight}" rx="6"></rect>
+              <text class="tooltip-date" x="10" y="17">${formatDate(
+                hovered.date,
+              )}</text>
+              <text class="tooltip-price" x="10" y="35">
+                ${formatCurrency(hovered.close, model.currency)}
+              </text>
+              ${hovered.trades.map((trade, index) =>
+                keyed(
+                  trade.id,
+                  html`
+                    <svg overflow="visible">
+                      <text
+                        class="${`tooltip-trade ${trade.type}`}"
+                        x="10"
+                        y="${51 + index * 16}"
+                      >
+                        ${trade.type === "buy" ? "Köp" : "Sälj"} ${formatShares(
+                          trade.record.quantity,
+                        )} st à ${formatCurrency(
+                          trade.native.price ?? trade.close,
+                          model.currency,
+                        )}
+                      </text>
+                    </svg>
+                  `,
+                )
+              )}
+            </g>
+          </svg>
+        `
+        : ""}
+    </svg>
+  `;
+}
+
+function chartMarker(marker, model) {
+  const cx = model.x(marker.index) + (marker.dx ?? 0);
+  const cy = model.y(marker.value);
+  const label = `${marker.type === "buy" ? "Köp" : "Sälj"} ${
+    formatShares(marker.record.quantity)
+  } st à ${formatCurrency(marker.value, model.currency)}${
+    marker.native.exact ? "" : " (omräknat)"
+  } · ${formatDate(marker.date)}`;
+
+  return marker.type === "buy"
+    ? html`
+      <svg overflow="visible" class="marker buy">
+        <title>${label}</title>
+        <circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="6"></circle>
+      </svg>
+    `
+    : html`
+      <svg overflow="visible" class="marker sell">
+        <title>${label}</title>
+        <path d="${`M${cx.toFixed(1)} ${(cy - 7).toFixed(1)} L${
+          (cx + 7).toFixed(1)
+        } ${cy.toFixed(1)} L${cx.toFixed(1)} ${(cy + 7).toFixed(1)} L${
+          (cx - 7).toFixed(1)
+        } ${cy.toFixed(1)} Z`}"></path>
+      </svg>
+    `;
+}
+
+function timingRow(trade, model) {
+  const isBuy = trade.type === "buy";
+  const record = trade.record;
+  const currency = tradeCurrency(record);
+  const since = trade.since;
+  const unchanged = since !== null && Math.abs(since) < 0.005;
+  const timingTone = since === null || unchanged
+    ? "neutral"
+    : toneClass(isBuy ? since : -since);
+  const verdict = since === null
+    ? "väntar på kurs"
+    : unchanged
+    ? "oförändrad kurs sedan affären"
+    : isBuy
+    ? since >= 0
+      ? "kursen har stigit sedan köpet"
+      : "kursen har fallit sedan köpet"
+    : since <= 0
+    ? "bra tajming – kursen har fallit sedan"
+    : "kursen har stigit sedan försäljningen";
+  const inChart = model
+    ? model.markers.some((marker) => marker.id === trade.id)
+    : false;
+
+  return html`
+    <article class="${`timing-row ${trade.type}`}">
+      <span class="${`badge ${trade.type}`}">${isBuy ? "Köp" : "Sälj"}</span>
+      <div>
+        <strong>${formatDate(trade.date)}</strong>
+        <span>${formatShares(record.quantity)} st à ${formatCurrency(
+          Number(record.price) || 0,
+          currency,
+        )}${model && !inChart ? " · utanför diagrammet" : ""}</span>
+      </div>
+      <div>
+        <span class="cell-label">${isBuy ? "Kostnad" : "Erhållet"}</span>
+        <strong>${money(tradeAmount(record, trade.type))}</strong>
+      </div>
+      <div>
+        <span class="cell-label">Kurs sedan affären</span>
+        <strong class="${timingTone}">${since === null
+          ? "–"
+          : formatPercent(since)}</strong>
+        <small class="muted">${verdict}</small>
+      </div>
+      <div>
+        <span class="cell-label">${isBuy ? "Anteckning" : "Realiserat"}</span>
+        ${isBuy
+          ? html`
+            <strong class="muted">${record.note || "–"}</strong>
+          `
+          : html`
+            <strong class="${toneClass(trade.result?.gain ?? 0)}">${moneySigned(
+              trade.result?.gain ?? 0,
+            )}</strong>
+            <small class="${toneClass(
+              trade.result?.gain ?? 0,
+            )}">${formatPercent(
+              trade.result?.gainPercent ?? 0,
+            )}</small>
+          `}
+      </div>
+    </article>
+  `;
+}
+
+function niceTicks(min, max, maxTicks = 6) {
+  const span = max - min || 1;
+  const magnitude = 10 ** Math.floor(Math.log10(span / maxTicks));
+  const candidates = [1, 2, 2.5, 5, 10, 20, 25, 50].map((factor) =>
+    factor * magnitude
+  );
+
+  for (const step of candidates) {
+    const ticks = ticksForStep(min, max, step);
+    if (ticks.length <= maxTicks) return ticks;
+  }
+  return ticksForStep(min, max, candidates.at(-1));
+}
+
+function ticksForStep(min, max, step) {
+  const ticks = [];
+  for (
+    let value = Math.ceil(min / step) * step;
+    value <= max + step * 1e-6;
+    value += step
+  ) {
+    ticks.push(Number(value.toFixed(10)));
+  }
+  return ticks;
+}
+
+function spreadIndices(length, count) {
+  if (length <= count) return Array.from({ length }, (_, index) => index);
+  const indices = new Set();
+  for (let step = 0; step < count; step += 1) {
+    indices.add(Math.round(step * (length - 1) / (count - 1)));
+  }
+  return [...indices];
+}
+
+function axisDate(value, range) {
+  const date = new Date(`${value}T00:00:00`);
+  if (Number.isNaN(date.getTime())) return value;
+  const short = range === "1mo" || range === "3mo" || range === "6mo";
+  return new Intl.DateTimeFormat(
+    "sv-SE",
+    short
+      ? { day: "numeric", month: "short" }
+      : { month: "short", year: "2-digit" },
+  ).format(date);
+}
+
+function axisPrice(value) {
+  return new Intl.NumberFormat("sv-SE", {
+    maximumFractionDigits: Math.abs(value) >= 100 ? 0 : 2,
+  }).format(value);
 }
 
 class PositionTable extends Component {
@@ -525,36 +2226,154 @@ class PositionTable extends Component {
   }
 }
 
-class LotsPage extends Component {
-  static tag = "lots-page";
+class TransactionsPage extends Component {
+  static tag = "transactions-page";
+  static properties = {
+    typeFilter: { type: String, default: "all" },
+    symbolFilter: { type: String, default: "" },
+  };
+
+  updated() {
+    syncSelect(this, "select.symbol-filter", this.effectiveSymbolFilter());
+  }
+
+  effectiveSymbolFilter() {
+    const symbols = new Set(getTrackedSymbolsWithTrades());
+    return symbols.has(this.symbolFilter) ? this.symbolFilter : "";
+  }
 
   render() {
-    const lots = [...state.lots].sort((a, b) =>
-      b.purchasedAt.localeCompare(a.purchasedAt)
+    const positions = getPositions();
+    const bySymbol = new Map(
+      positions.map((position) => [position.symbol, position]),
     );
-    const quotes = state.quotes;
+    const entries = buildTransactionEntries(bySymbol);
+    const symbols = [...new Set(entries.map((entry) => entry.symbol))].sort();
+    const symbolFilter = symbols.includes(this.symbolFilter)
+      ? this.symbolFilter
+      : "";
+    const inScope = entries.filter((entry) =>
+      !symbolFilter || entry.symbol === symbolFilter
+    );
+    const visible = inScope.filter((entry) =>
+      this.typeFilter === "all" || entry.type === this.typeFilter
+    );
+    const buys = inScope.filter((entry) => entry.type === "buy");
+    const sells = inScope.filter((entry) => entry.type === "sell");
+    const invested = buys.reduce(
+      (total, entry) => total + tradeAmount(entry.record, "buy"),
+      0,
+    );
+    const proceeds = sells.reduce(
+      (total, entry) => total + (entry.result?.netProceeds ?? 0),
+      0,
+    );
+    const realized = sells.reduce(
+      (total, entry) => total + (entry.result?.gain ?? 0),
+      0,
+    );
+    const realizedCost = sells.reduce(
+      (total, entry) => total + (entry.result?.costBasis ?? 0),
+      0,
+    );
+    const hasHoldings = positions.some((position) => position.isHolding);
 
     return html`
       <section class="page-stack">
         <section class="panel">
           <div class="panel-heading">
             <div>
-              <h1>Köp</h1>
+              <h1>Transaktioner</h1>
               <p>
-                Priser och avgifter sparas som SEK i IndexedDB. Redigera genom att ta
-                bort och lägga till igen.
+                Köp och försäljningar sparas lokalt i IndexedDB, i affärens
+                valuta med växelkursen på affärsdagen. Resultatet räknas i SEK
+                mot snittkursen vid tillfället (genomsnittsmetoden).
               </p>
             </div>
+            ${hasHoldings
+              ? html`
+                <button
+                  type="button"
+                  class="sell-button"
+                  on-click="${() => openSellDialog(symbolFilter)}"
+                >
+                  Sälj innehav
+                </button>
+              `
+              : ""}
           </div>
-          ${lots.length
+
+          ${entries.length
             ? html`
-              <div class="lot-list">
-                ${lots.map((lot) =>
-                  keyed(lot.id, lotRow(lot, quotes[lot.symbol]))
+              <div class="tx-summary">
+                <div class="fact">
+                  <small>Investerat</small>
+                  <strong>${money(invested)}</strong>
+                  <span>${countLabel(buys.length, "köp", "köp")}</span>
+                </div>
+                <div class="fact">
+                  <small>Sålt för</small>
+                  <strong>${money(proceeds)}</strong>
+                  <span>${countLabel(
+                    sells.length,
+                    "försäljning",
+                    "försäljningar",
+                  )}</span>
+                </div>
+                <div class="fact">
+                  <small>Realiserat</small>
+                  <strong class="${toneClass(realized)}">${moneySigned(
+                    realized,
+                  )}</strong>
+                  <span class="${sells.length ? toneClass(realized) : "muted"}">
+                    ${sells.length
+                      ? formatPercent(
+                        realizedCost > 0 ? realized / realizedCost * 100 : 0,
+                      )
+                      : "inga försäljningar"}
+                  </span>
+                </div>
+              </div>
+
+              <div class="filter-bar">
+                <div class="chip-row" role="group" aria-label="Typ">
+                  ${filterChip(this, "all", `Alla · ${inScope.length}`)}
+                  ${filterChip(this, "buy", `Köp · ${buys.length}`)}
+                  ${filterChip(this, "sell", `Sälj · ${sells.length}`)}
+                </div>
+                <select
+                  class="symbol-filter"
+                  aria-label="Filtrera på symbol"
+                  on-change="${(event) =>
+                    this.symbolFilter = event.target.value}"
+                >
+                  <option value="">Alla symboler</option>
+                  ${symbols.map((symbol) =>
+                    keyed(
+                      symbol,
+                      html`
+                        <option value="${symbol}">${symbol}</option>
+                      `,
+                    )
+                  )}
+                </select>
+              </div>
+            `
+            : ""}
+
+          ${visible.length
+            ? html`
+              <div class="transaction-list">
+                ${visible.map((entry) =>
+                  keyed(entry.id, transactionRow(entry))
                 )}
               </div>
             `
-            : emptyState("Inga köp har sparats.")}
+            : emptyState(
+              entries.length
+                ? "Inga transaktioner matchar filtret."
+                : "Inga transaktioner har sparats. Lägg till ett köp på översikten.",
+            )}
         </section>
       </section>
     `;
@@ -675,12 +2494,12 @@ class SettingsPage extends Component {
   exportData = () => {
     const payload = {
       app: "Stockroom",
-      version: 1,
+      version: 2,
       exportedAt: new Date().toISOString(),
       lots: state.lots,
+      sales: state.sales,
       watchlist: state.watchlist,
       quotes: state.quotes,
-      histories: state.histories,
       settings: state.settings,
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], {
@@ -735,13 +2554,21 @@ class SettingsPage extends Component {
   };
 
   render() {
+    const current = displayCurrency();
+    const knownRates = Object.entries(state.fxRates)
+      .filter(([, rate]) => Number.isFinite(rate))
+      .sort(([a], [b]) => a.localeCompare(b));
+
     return html`
       <section class="settings-grid">
         <section class="panel">
           <div class="panel-heading">
             <div>
               <h1>Lokal data</h1>
-              <p>Portföljposter stannar i den här webbläsarens IndexedDB.</p>
+              <p>
+                Köp, försäljningar och bevakningar stannar i den här
+                webbläsarens IndexedDB.
+              </p>
             </div>
           </div>
           <div class="settings-actions">
@@ -775,13 +2602,69 @@ class SettingsPage extends Component {
           </div>
           <div class="storage-stats">
             <span><strong>${state.lots.length}</strong> köp</span>
+            <span><strong>${state.sales.length}</strong> försäljningar</span>
             <span><strong>${state.watchlist
               .length}</strong> bevakade symboler</span>
             <span><strong>${Object.keys(state.quotes)
               .length}</strong> kursbilder</span>
-            <span><strong>${Object.keys(state.histories)
-              .length}</strong> historikposter</span>
+            <span><strong>${History.all()
+              .length}</strong> kurshistoriker synkade från servern</span>
           </div>
+        </section>
+
+        <section class="panel currency-panel">
+          <div class="panel-heading">
+            <div>
+              <h2>Valuta</h2>
+              <p>
+                Affärer bokförs i SEK med växelkursen på affärsdagen.
+                Visningsvalutan räknar om hela portföljen med aktuell kurs.
+              </p>
+            </div>
+          </div>
+          <div class="settings-actions">
+            <span class="muted">Visningsvaluta</span>
+            <div class="segmented" role="group" aria-label="Visningsvaluta">
+              ${VIEW_CURRENCIES.map((currency) =>
+                keyed(
+                  currency,
+                  html`
+                    <button
+                      type="button"
+                      class="${`segment ${
+                        current === currency ? "active" : ""
+                      }`}"
+                      aria-pressed="${current === currency}"
+                      on-click="${() => setDisplayCurrency(currency)}"
+                    >
+                      ${currency}
+                    </button>
+                  `,
+                )
+              )}
+            </div>
+          </div>
+          ${knownRates.length
+            ? html`
+              <div class="storage-stats rates-list">
+                ${knownRates.map(([currency, rate]) =>
+                  keyed(
+                    currency,
+                    html`
+                      <span>
+                        <span>1 ${currency}</span>
+                        <strong>${formatCurrency(rate, BASE_CURRENCY)}</strong>
+                      </span>
+                    `,
+                  )
+                )}
+              </div>
+            `
+            : html`
+              <p class="inline-message">
+                Växelkurser hämtas från Yahoo Finance när de behövs.
+              </p>
+            `}
         </section>
       </section>
     `;
@@ -791,15 +2674,21 @@ class SettingsPage extends Component {
 AppRoot.register();
 DashboardPage.register();
 AddLotForm.register();
+SellDialog.register();
 PositionTable.register();
-LotsPage.register();
+HoldingsPage.register();
+TransactionsPage.register();
 ResearchPage.register();
 SettingsPage.register();
 
 createRouter({
   routes: [
     { path: "/", component: "dashboard-page" },
-    { path: "/lots", component: "lots-page" },
+    { path: "/holdings", component: "holdings-page" },
+    { path: "/holdings/:symbol", component: "holdings-page" },
+    { path: "/transactions", component: "transactions-page" },
+    // Old bookmark from before sales existed.
+    { path: "/lots", component: "transactions-page" },
     { path: "/research", component: "research-page" },
     { path: "/settings", component: "settings-page" },
   ],
@@ -810,18 +2699,22 @@ void initialize();
 async function initialize() {
   await hydrateState();
   await refreshTrackedSymbols({ forceHistory: false, quiet: true });
+  await ensureFxRates(neededFxCurrencies(), { required: false }).catch(
+    () => {},
+  );
 }
 
 async function hydrateState() {
   const data = await loadLocalData();
   state.lots = data.lots;
+  state.sales = data.sales ?? [];
   state.watchlist = data.watchlist;
   state.quotes = data.quotes;
   state.fxRates = fxRatesFromQuotes(data.quotes);
-  state.histories = data.histories;
   state.settings = {
     refreshMinutes: 5,
     lastRefresh: "",
+    displayCurrency: BASE_CURRENCY,
     ...data.settings,
   };
   state.ready = true;
@@ -832,23 +2725,146 @@ function getPositions() {
     state.lots,
     state.watchlist,
     state.quotes,
-    state.histories,
+    historiesForPositions(),
     state.fxRates,
+    state.sales,
   );
 }
 
+/* ---------- price history (server cached, synced) ---------- */
+
+const historyLoads = new Map();
+
+/**
+ * Make sure the server has `symbol` cached and track the request state for
+ * the UI. The data itself arrives through the synced `History` model.
+ */
+function loadHistory(symbol, options = {}) {
+  const key = normalizeSymbol(symbol);
+  if (!key) return Promise.resolve();
+
+  const pending = historyLoads.get(key);
+  if (pending) return pending;
+
+  const current = state.historyStatus[key];
+  const now = Date.now();
+  if (!options.force && current) {
+    if (current.status === "ready" && now - current.at < 5 * 60_000) {
+      return Promise.resolve();
+    }
+    if (current.status === "error" && now - current.at < 60_000) {
+      return Promise.resolve();
+    }
+  }
+
+  setHistoryStatus(key, { status: "loading", error: "", at: now });
+  const task = (async () => {
+    try {
+      const result = await ensureHistory(key, {
+        maxAgeMs: options.force ? 0 : undefined,
+      });
+      setHistoryStatus(key, {
+        status: "ready",
+        error: result?.stale ? result.error ?? "" : "",
+        at: Date.now(),
+      });
+    } catch (error) {
+      setHistoryStatus(key, {
+        status: "error",
+        error: error.message,
+        at: Date.now(),
+      });
+    } finally {
+      historyLoads.delete(key);
+    }
+  })();
+  historyLoads.set(key, task);
+  return task;
+}
+
+function setHistoryStatus(symbol, value) {
+  state.historyStatus = { ...state.historyStatus, [symbol]: value };
+}
+
+/**
+ * The synced series for `symbol` cut to `range`, in the instrument's raw
+ * units, with the live quote laid over today's bar. Null until cached.
+ */
+function recentHistory(symbol, range) {
+  const series = historySeries(symbol);
+  if (!series) return null;
+  const quote = state.quotes[symbol];
+  const scale = minorUnit(quote?.rawCurrency ?? quote?.currency).divisor;
+  return {
+    symbol,
+    updatedAt: series.updatedAt,
+    points: withLiveQuote(pointsInRange(series.points, range), quote, scale),
+  };
+}
+
+function historiesForPositions() {
+  const histories = {};
+  for (const symbol of getTrackedSymbols()) {
+    const history = recentHistory(symbol, "6mo");
+    if (history) histories[symbol] = history;
+  }
+  return histories;
+}
+
+/* ---------- money display ---------- */
+
+function displayCurrency() {
+  const value = normalizeCurrency(state.settings.displayCurrency);
+  return VIEW_CURRENCIES.includes(value) ? value : BASE_CURRENCY;
+}
+
+/** Format a SEK amount in the chosen view currency (falls back to SEK). */
+function money(sekValue) {
+  const currency = displayCurrency();
+  const converted = convertFromSek(sekValue, currency, state.fxRates);
+  return converted === null
+    ? formatCurrency(sekValue, BASE_CURRENCY)
+    : formatCurrency(converted, currency);
+}
+
+function moneySigned(sekValue) {
+  const currency = displayCurrency();
+  const converted = convertFromSek(sekValue, currency, state.fxRates);
+  return converted === null
+    ? formatSignedCurrency(sekValue, BASE_CURRENCY)
+    : formatSignedCurrency(converted, currency);
+}
+
+async function setDisplayCurrency(currency) {
+  const value = normalizeCurrency(currency);
+  if (!VIEW_CURRENCIES.includes(value)) return;
+  state.settings = { ...state.settings, displayCurrency: value };
+  await saveSetting("displayCurrency", value);
+  try {
+    await ensureFxRates([value], { required: true });
+  } catch (error) {
+    state.error = error.message;
+  }
+}
+
+/* ---------- trades ---------- */
+
 async function addLot(input) {
   const symbol = normalizeSymbol(input.symbol);
+  const currency = normalizeCurrency(input.currency) || BASE_CURRENCY;
+  const now = new Date().toISOString();
   const lot = {
     id: crypto.randomUUID(),
     symbol,
-    quantity: Number(input.quantity),
+    quantity: roundQuantity(input.quantity),
     price: Number(input.price),
+    currency,
+    fxRate: currency === BASE_CURRENCY ? 1 : Number(input.fxRate),
     purchasedAt: input.purchasedAt,
-    fees: Number(input.fees ?? 0),
+    fees: Number(input.fees ?? 0) || 0,
     note: input.note ?? "",
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
+    createdAt: now,
+    updatedAt: now,
   };
 
   await saveLot(lot);
@@ -862,6 +2878,156 @@ async function deleteLot(id) {
   await removeLot(id);
   state.lots = state.lots.filter((lot) => lot.id !== id);
 }
+
+async function addSale(input) {
+  const symbol = normalizeSymbol(input.symbol);
+  if (!symbol) throw new Error("Aktiesymbol saknas");
+  const currency = normalizeCurrency(input.currency) || BASE_CURRENCY;
+
+  const now = new Date().toISOString();
+  const sale = {
+    id: crypto.randomUUID(),
+    symbol,
+    quantity: roundQuantity(input.quantity),
+    price: Number(input.price),
+    currency,
+    fxRate: currency === BASE_CURRENCY ? 1 : Number(input.fxRate),
+    soldAt: input.soldAt,
+    fees: Number(input.fees ?? 0) || 0,
+    note: input.note ?? "",
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  await saveSale(sale);
+  state.sales = [sale, ...state.sales].sort((a, b) =>
+    b.soldAt.localeCompare(a.soldAt)
+  );
+
+  const position = getPositions().find((item) => item.symbol === symbol);
+  const result = position?.ledger.saleResults.get(sale.id) ?? {
+    netProceeds: tradeAmount(sale, "sell"),
+    costBasis: 0,
+    gain: 0,
+    gainPercent: 0,
+  };
+  return { sale, result };
+}
+
+async function deleteSale(id) {
+  await removeSale(id);
+  state.sales = state.sales.filter((sale) => sale.id !== id);
+}
+
+async function confirmDeleteLot(lot) {
+  const ok = confirm(
+    `Ta bort köpet av ${formatShares(lot.quantity)} ${lot.symbol} (${
+      formatDate(lot.purchasedAt)
+    })?`,
+  );
+  if (!ok) return;
+  await deleteLot(lot.id);
+}
+
+async function confirmDeleteSale(sale) {
+  const ok = confirm(
+    `Ta bort försäljningen av ${formatShares(sale.quantity)} ${sale.symbol} (${
+      formatDate(sale.soldAt)
+    })? Aktierna räknas då som ägda igen.`,
+  );
+  if (!ok) return;
+  await deleteSale(sale.id);
+}
+
+function openSellDialog(symbol = "") {
+  state.sellRequest = {
+    symbol: normalizeSymbol(symbol),
+    openedAt: Date.now(),
+  };
+}
+
+function closeSellDialog() {
+  if (state.sellRequest) state.sellRequest = null;
+}
+
+/* ---------- price & FX lookups ---------- */
+
+/**
+ * Best price for a trade on `date`: the closing price that day (or the last
+ * trading day before it) in the instrument's own currency, plus the SEK rate
+ * for that currency on the same date. Falls back to the latest quote/rate.
+ */
+async function lookupTradePrice(symbol, date) {
+  const quote = await refreshOneSymbol(symbol);
+  const currency = normalizeCurrency(quote.currency) || BASE_CURRENCY;
+  const divisor = minorUnit(quote.rawCurrency ?? quote.currency).divisor;
+  const close = await closeOn(quote.symbol, date).catch(() => null);
+  const fx = await fxRateOn(currency, date);
+
+  return {
+    symbol: quote.symbol,
+    currency,
+    price: close ? close.close / divisor : quote.price,
+    priceDate: close?.date ?? null,
+    fxRate: fx.rate,
+    fxDate: fx.date,
+  };
+}
+
+async function fxRateOn(currency, date) {
+  const normalized = normalizeCurrency(currency);
+  if (!normalized || normalized === BASE_CURRENCY) {
+    return { rate: 1, date: null };
+  }
+
+  const close = await closeOn(fxSymbolForCurrency(normalized), date).catch(
+    () => null,
+  );
+  if (close) return { rate: close.close, date: close.date };
+
+  await ensureFxRates([normalized], { required: true });
+  return { rate: state.fxRates[normalized], date: null };
+}
+
+/** Closing price on `date` or the nearest trading day before it. */
+async function closeOn(symbol, date) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || date >= today()) return null;
+
+  await loadHistory(symbol);
+  const series = historySeries(symbol);
+  if (!series) return null;
+
+  const point = series.points.filter((item) => item.date <= date).at(-1);
+  return point ? { close: point.close, date: point.date } : null;
+}
+
+function describeLookup(symbol, lookup) {
+  const when = lookup.priceDate
+    ? `Stängningskurs ${formatDate(lookup.priceDate)}`
+    : "Senaste kurs";
+  const fx = lookup.currency === BASE_CURRENCY
+    ? ""
+    : ` · ${formatNumber(lookup.fxRate, 4)} SEK/${lookup.currency}${
+      lookup.fxDate ? "" : " (aktuell kurs)"
+    }`;
+  return `${when} för ${symbol}: ${
+    formatCurrency(lookup.price, lookup.currency)
+  }${fx}.`;
+}
+
+function priceInputValue(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "";
+  return String(Number(number.toFixed(number < 10 ? 4 : 2)));
+}
+
+function rateInputValue(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) return "";
+  return String(Number(number.toFixed(4)));
+}
+
+/* ---------- watchlist & quotes ---------- */
 
 async function trackSymbol(symbol, options = {}) {
   const cleanSymbol = normalizeSymbol(symbol);
@@ -900,28 +3066,30 @@ async function refreshOneSymbol(symbol) {
     );
   }
 
-  await storeQuote(quote);
-  await ensureFxRatesForQuotes([quote], { required: true });
-  await refreshHistoryIfNeeded(quote.symbol, true);
-  return quote;
+  const record = await storeQuote(quote);
+  await ensureFxRatesForQuotes([record], { required: true });
+  await refreshHistoryIfNeeded(record.symbol, true);
+  await markRefreshed();
+  return record;
 }
 
 async function refreshTrackedSymbols(options = {}) {
   const symbols = getTrackedSymbols();
-  if (symbols.length === 0) return;
+  const fxSymbols = neededFxCurrencies().map(fxSymbolForCurrency);
+  if (symbols.length === 0 && fxSymbols.length === 0) return;
   if (state.refreshing) return;
 
   state.refreshing = true;
   if (!options.quiet) state.error = "";
   try {
-    const payload = await fetchQuotes(symbols);
-    const quotes = payload.quotes ?? [];
-    for (const quote of quotes) await storeQuote(quote);
+    const payload = await fetchQuotes([...symbols, ...fxSymbols]);
+    const quotes = [];
+    for (const quote of payload.quotes ?? []) {
+      quotes.push(await storeQuote(quote));
+    }
     await ensureFxRatesForQuotes(quotes, { required: false });
 
-    const refreshedAt = new Date().toISOString();
-    state.settings = { ...state.settings, lastRefresh: refreshedAt };
-    await saveSetting("lastRefresh", refreshedAt);
+    await markRefreshed();
 
     for (const symbol of symbols.slice(0, 24)) {
       await refreshHistoryIfNeeded(symbol, options.forceHistory).catch(
@@ -941,50 +3109,85 @@ async function refreshTrackedSymbols(options = {}) {
   }
 }
 
+async function markRefreshed() {
+  const refreshedAt = new Date().toISOString();
+  state.settings = { ...state.settings, lastRefresh: refreshedAt };
+  await saveSetting("lastRefresh", refreshedAt);
+}
+
+/**
+ * Persist a quote. Markets quoted in minor units (LSE pence etc.) are
+ * normalised to the major currency so FX conversion is correct.
+ */
 async function storeQuote(quote) {
+  const unit = minorUnit(quote.rawCurrency ?? quote.currency);
+  const scale = (value) =>
+    Number.isFinite(value) ? value / unit.divisor : value;
   const record = {
     ...quote,
     symbol: normalizeSymbol(quote.symbol),
+    rawCurrency: quote.rawCurrency ?? quote.currency,
+    currency: unit.currency,
+    price: scale(quote.price),
+    previousClose: scale(quote.previousClose),
+    change: scale(quote.change),
+    dayHigh: scale(quote.dayHigh),
+    dayLow: scale(quote.dayLow),
+    fiftyTwoWeekHigh: scale(quote.fiftyTwoWeekHigh),
+    fiftyTwoWeekLow: scale(quote.fiftyTwoWeekLow),
     updatedAt: new Date().toISOString(),
   };
   await saveQuote(record);
   state.quotes = { ...state.quotes, [record.symbol]: record };
   rememberFxRate(record);
-}
-
-async function quotePriceSek(quote) {
-  await ensureFxRatesForQuotes([quote], { required: true });
-  return convertToSek(quote.price, quote.currency, state.fxRates);
+  return record;
 }
 
 async function ensureFxRatesForQuotes(quotes, options = {}) {
-  const currencies = [
+  await ensureFxRates(quotes.map((quote) => quote.currency), options);
+}
+
+async function ensureFxRates(currencies, options = {}) {
+  const wanted = [
     ...new Set(
-      quotes
-        .map((quote) => normalizeCurrency(quote.currency))
-        .filter((currency) => currency && currency !== DISPLAY_CURRENCY),
+      currencies
+        .map(normalizeCurrency)
+        .filter((currency) => currency && currency !== BASE_CURRENCY),
     ),
   ];
-  const missingCurrencies = currencies.filter((currency) =>
+  const missing = wanted.filter((currency) =>
     !Number.isFinite(state.fxRates[currency])
   );
+  if (missing.length === 0) return;
 
-  if (missingCurrencies.length === 0) return;
-
-  const fxSymbols = missingCurrencies.map(fxSymbolForCurrency);
-  const payload = await fetchQuotes(fxSymbols);
+  const payload = await fetchQuotes(missing.map(fxSymbolForCurrency));
   for (const quote of payload.quotes ?? []) await storeQuote(quote);
 
-  const stillMissing = missingCurrencies.filter((currency) =>
+  const stillMissing = missing.filter((currency) =>
     !Number.isFinite(state.fxRates[currency])
   );
   if (options.required && stillMissing.length) {
     throw new Error(
-      `Kunde inte konvertera ${
+      `Kunde inte hämta växelkurs för ${
         stillMissing.join(", ")
-      } till ${DISPLAY_CURRENCY}.`,
+      } till ${BASE_CURRENCY}.`,
     );
   }
+}
+
+/** Every currency we need a live SEK rate for: view, trades and quotes. */
+function neededFxCurrencies() {
+  const wanted = new Set();
+  const add = (currency) => {
+    const normalized = normalizeCurrency(currency);
+    if (normalized && normalized !== BASE_CURRENCY) wanted.add(normalized);
+  };
+
+  add(displayCurrency());
+  for (const lot of state.lots) add(lot.currency);
+  for (const sale of state.sales) add(sale.currency);
+  for (const symbol of getTrackedSymbols()) add(state.quotes[symbol]?.currency);
+  return [...wanted];
 }
 
 function rememberFxRate(quote) {
@@ -1008,7 +3211,7 @@ function fxRatesFromQuotes(quotes) {
 }
 
 function fxSymbolForCurrency(currency) {
-  return `${normalizeCurrency(currency)}${DISPLAY_CURRENCY}=X`;
+  return `${normalizeCurrency(currency)}${BASE_CURRENCY}=X`;
 }
 
 function sourceCurrencyFromFxSymbol(symbol) {
@@ -1016,31 +3219,63 @@ function sourceCurrencyFromFxSymbol(symbol) {
   return match?.[1] ?? "";
 }
 
-function normalizeCurrency(currency) {
-  return String(currency ?? "").trim().toUpperCase();
-}
-
-async function refreshHistoryIfNeeded(symbol, force = false) {
-  const existing = state.histories[symbol];
-  const ageMs = existing?.updatedAt
-    ? Date.now() - new Date(existing.updatedAt).getTime()
-    : Infinity;
-
-  if (!force && ageMs < 6 * 60 * 60 * 1000) return;
-
-  const history = await fetchHistory(symbol, "6mo");
-  await saveHistory(history);
-  state.histories = { ...state.histories, [history.symbol]: history };
+function refreshHistoryIfNeeded(symbol, force = false) {
+  // The server decides when Yahoo is asked again; this only makes sure the
+  // symbol is cached there and streamed to us.
+  return loadHistory(symbol, { force });
 }
 
 function getTrackedSymbols() {
   return [
     ...new Set([
       ...state.watchlist.map((item) => item.symbol),
-      ...state.lots.map((lot) => lot.symbol),
+      ...getTrackedSymbolsWithTrades(),
     ]),
   ].filter(Boolean);
 }
+
+function getTrackedSymbolsWithTrades() {
+  return [
+    ...new Set([
+      ...state.lots.map((lot) => lot.symbol),
+      ...state.sales.map((sale) => sale.symbol),
+    ]),
+  ].filter(Boolean);
+}
+
+function buildTransactionEntries(bySymbol) {
+  const entries = [
+    ...state.lots.map((lot) => ({
+      id: lot.id,
+      type: "buy",
+      symbol: lot.symbol,
+      date: lot.purchasedAt ?? "",
+      createdAt: lot.createdAt ?? "",
+      record: lot,
+      position: bySymbol.get(lot.symbol) ?? null,
+      result: null,
+    })),
+    ...state.sales.map((sale) => {
+      const position = bySymbol.get(sale.symbol) ?? null;
+      return {
+        id: sale.id,
+        type: "sell",
+        symbol: sale.symbol,
+        date: sale.soldAt ?? "",
+        createdAt: sale.createdAt ?? "",
+        record: sale,
+        position,
+        result: position?.ledger.saleResults.get(sale.id) ?? null,
+      };
+    }),
+  ];
+
+  return entries.sort((a, b) =>
+    b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)
+  );
+}
+
+/* ---------- small helpers ---------- */
 
 function lastRefreshText() {
   const value = state.settings.lastRefresh;
@@ -1057,14 +3292,56 @@ function today() {
   return new Date().toISOString().slice(0, 10);
 }
 
+function countLabel(count, singular, plural) {
+  return `${count} ${count === 1 ? singular : plural}`;
+}
+
+function syncSelect(root, selector, value) {
+  const select = root.querySelector(selector);
+  if (select && select.value !== value) select.value = value;
+}
+
+function currencySelect(current, onChange) {
+  const options = TRADE_CURRENCIES.includes(current)
+    ? TRADE_CURRENCIES
+    : [current, ...TRADE_CURRENCIES];
+  return html`
+    <select
+      class="currency-select"
+      aria-label="Valuta"
+      .value="${current}"
+      on-change="${onChange}"
+    >
+      ${options.map((currency) =>
+        keyed(
+          currency,
+          html`
+            <option value="${currency}" selected="${currency ===
+              current}">${currency}</option>
+          `,
+        )
+      )}
+    </select>
+  `;
+}
+
+/* ---------- templates ---------- */
+
 function positionRow(position) {
   const path = sparklinePath(position.history?.points ?? [], 180, 54);
+  const quote = position.quote;
+  const quoteCurrency = normalizeCurrency(quote?.currency) || BASE_CURRENCY;
+  const showNative = quote && quoteCurrency !== displayCurrency();
+
   return html`
     <article class="position-row">
-      <div class="identity-cell">
+      <router-link
+        class="identity-cell row-link"
+        to="${`/holdings/${encodeURIComponent(position.symbol)}`}"
+      >
         <strong>${position.symbol}</strong>
         <span>${position.name}</span>
-      </div>
+      </router-link>
       <svg
         class="sparkline"
         viewBox="0 0 180 54"
@@ -1078,70 +3355,154 @@ function positionRow(position) {
       </svg>
       <div>
         <span class="cell-label">Antal</span>
-        <strong>${formatNumber(position.shares, 4)}</strong>
+        <strong>${formatShares(position.shares)}</strong>
+        <small class="muted">snitt ${money(position.averageCost)}</small>
       </div>
       <div>
         <span class="cell-label">Pris</span>
-        <strong>${formatCurrency(position.price)}</strong>
+        <strong>${money(position.price)}</strong>
+        <small class="${toneClass(quote?.changePercent ?? 0)}">${showNative
+          ? `${formatCurrency(quote.price, quoteCurrency)} · `
+          : ""}${formatPercent(quote?.changePercent ?? 0)} idag</small>
       </div>
       <div>
         <span class="cell-label">Värde</span>
-        <strong>${formatCurrency(position.marketValue)}</strong>
+        <strong>${money(position.marketValue)}</strong>
+        ${position.sellCount
+          ? html`
+            <small class="${toneClass(position.realized)}">${moneySigned(
+              position.realized,
+            )} realiserat</small>
+          `
+          : ""}
       </div>
       <div>
         <span class="cell-label">Resultat</span>
         <strong class="${toneClass(position.gain)}">
-          ${formatCurrency(position.gain)}
+          ${moneySigned(position.gain)}
         </strong>
         <small class="${toneClass(position.gain)}">${formatPercent(
           position.gainPercent,
         )}</small>
       </div>
+      <button
+        type="button"
+        class="sell-button compact"
+        on-click="${() => openSellDialog(position.symbol)}"
+      >
+        Sälj
+      </button>
     </article>
   `;
 }
 
-function lotRow(lot, quote) {
-  const currentPrice = quote
-    ? convertToSek(quote.price, quote.currency, state.fxRates)
-    : lot.price;
-  const currentValue = lot.quantity * currentPrice;
-  const cost = lot.quantity * lot.price + (lot.fees ?? 0);
-  const gain = currentValue - cost;
+function transactionRow(entry) {
+  const { record, position, result } = entry;
+  const isBuy = entry.type === "buy";
+  const quantity = Number(record.quantity) || 0;
+  const price = Number(record.price) || 0;
+  const fees = Number(record.fees) || 0;
+  const currency = tradeCurrency(record);
+  const fxRate = tradeFxRate(record);
+  const foreign = currency !== BASE_CURRENCY;
+  const amount = tradeAmount(record, entry.type);
+  const quote = position?.quote;
+  const quoteCurrency = normalizeCurrency(quote?.currency) || BASE_CURRENCY;
+  // Compare in the trade's own currency when the quote matches it, so the
+  // number reflects the share price and not FX drift.
+  const sinceBuy = !isBuy || price <= 0
+    ? null
+    : quote && quoteCurrency === currency && quote.price > 0
+    ? (quote.price - price) / price * 100
+    : position && position.price > 0
+    ? (position.price - tradeUnitCost(record)) / tradeUnitCost(record) * 100
+    : null;
+  const gain = result?.gain ?? 0;
 
   return html`
-    <article class="lot-row">
-      <div>
-        <strong>${lot.symbol}</strong>
-        <span>${lot.note || "Ingen anteckning"}</span>
+    <article class="${`transaction-row ${entry.type}`}">
+      <div class="tx-identity">
+        <span class="${`badge ${entry.type}`}">${isBuy ? "Köp" : "Sälj"}</span>
+        <div>
+          <strong>${record.symbol}</strong>
+          <span>${record.note || position?.name || record.symbol}</span>
+        </div>
       </div>
       <div>
         <span class="cell-label">Datum</span>
-        <strong>${lot.purchasedAt}</strong>
+        <strong>${formatDate(entry.date)}</strong>
       </div>
       <div>
         <span class="cell-label">Antal</span>
-        <strong>${formatNumber(lot.quantity, 4)}</strong>
+        <strong>${formatShares(quantity)}</strong>
       </div>
       <div>
-        <span class="cell-label">Anskaffning</span>
-        <strong>${formatCurrency(cost)}</strong>
+        <span class="cell-label">Kurs</span>
+        <strong>${formatCurrency(price, currency)}</strong>
+        <small class="muted">${[
+          foreign
+            ? `× ${formatNumber(fxRate, 4)} = ${money(price * fxRate)}`
+            : "",
+          fees > 0 ? `avgift ${formatCurrency(fees, currency)}` : "",
+        ].filter(Boolean).join(" · ")}</small>
       </div>
       <div>
-        <span class="cell-label">Resultat</span>
-        <strong class="${toneClass(gain)}">${formatCurrency(
-          gain,
-        )}</strong>
+        <span class="cell-label">${isBuy ? "Kostnad" : "Erhållet"}</span>
+        <strong>${money(amount)}</strong>
       </div>
-      <button class="danger-button compact" on-click="${() =>
-        deleteLot(lot.id)}">Ta bort</button>
+      <div>
+        <span class="cell-label">${isBuy
+          ? "Kurs sedan köp"
+          : "Realiserat"}</span>
+        ${isBuy
+          ? html`
+            <strong class="${toneClass(sinceBuy ?? 0)}">${sinceBuy === null
+              ? "–"
+              : formatPercent(sinceBuy)}</strong>
+            <small class="muted">${sinceBuy === null
+              ? "väntar på kurs"
+              : `nu ${
+                quote && quoteCurrency === currency
+                  ? formatCurrency(quote.price, currency)
+                  : money(position?.price ?? 0)
+              }`}</small>
+          `
+          : html`
+            <strong class="${toneClass(gain)}">${moneySigned(gain)}</strong>
+            <small class="${toneClass(gain)}">${formatPercent(
+              result?.gainPercent ?? 0,
+            )} · snitt ${money(result?.averageCost ?? 0)}</small>
+          `}
+      </div>
+      <button
+        type="button"
+        class="danger-button compact"
+        on-click="${() =>
+          isBuy ? confirmDeleteLot(record) : confirmDeleteSale(record)}"
+      >
+        Ta bort
+      </button>
     </article>
+  `;
+}
+
+function filterChip(page, value, label) {
+  return html`
+    <button
+      type="button"
+      class="${`chip ${page.typeFilter === value ? "active" : ""}`}"
+      on-click="${() => page.typeFilter = value}"
+    >
+      ${label}
+    </button>
   `;
 }
 
 function watchCard(position) {
   const quote = position.quote;
   const path = sparklinePath(position.history?.points ?? [], 240, 72);
+  const quoteCurrency = normalizeCurrency(quote?.currency) || BASE_CURRENCY;
+  const showNative = quote && quoteCurrency !== displayCurrency();
 
   return html`
     <article class="watch-card">
@@ -1152,7 +3513,20 @@ function watchCard(position) {
         </div>
         ${position.isHolding
           ? html`
-            <span class="pill">Innehav</span>
+            <div class="card-actions">
+              <span class="pill">${formatShares(position.shares)} st</span>
+              <button
+                type="button"
+                class="sell-button compact"
+                on-click="${() => openSellDialog(position.symbol)}"
+              >
+                Sälj
+              </button>
+            </div>
+          `
+          : position.isClosed
+          ? html`
+            <span class="pill closed">Avslutad</span>
           `
           : html`
             <button on-click="${() =>
@@ -1173,7 +3547,15 @@ function watchCard(position) {
       <div class="watch-stats">
         <span>
           <small>Senast</small>
-          <strong>${formatCurrency(position.price)}</strong>
+          <strong>${money(position.price)}</strong>
+          ${showNative
+            ? html`
+              <em class="muted">${formatCurrency(
+                quote.price,
+                quoteCurrency,
+              )}</em>
+            `
+            : ""}
         </span>
         <span>
           <small>Rörelse</small>
@@ -1182,10 +3564,18 @@ function watchCard(position) {
           </strong>
         </span>
         <span>
-          <small>Uppdaterad</small>
-          <strong>${quote?.marketTime
-            ? shortDate(quote.marketTime)
-            : "Väntar"}</strong>
+          <small>${position.sellCount ? "Realiserat" : "Uppdaterad"}</small>
+          ${position.sellCount
+            ? html`
+              <strong class="${toneClass(position.realized)}">${moneySigned(
+                position.realized,
+              )}</strong>
+            `
+            : html`
+              <strong>${quote?.marketTime
+                ? shortDate(quote.marketTime)
+                : "Väntar"}</strong>
+            `}
         </span>
       </div>
     </article>
@@ -1205,7 +3595,7 @@ function allocationList(holdings, totalValue) {
             <div class="allocation-row">
               <div>
                 <strong>${position.symbol}</strong>
-                <span>${formatCurrency(position.marketValue)}</span>
+                <span>${money(position.marketValue)}</span>
               </div>
               <div class="allocation-track">
                 <span style="${`width: ${
@@ -1221,13 +3611,44 @@ function allocationList(holdings, totalValue) {
   `;
 }
 
+function realizedList(positions) {
+  return html`
+    <div class="realized-list">
+      ${positions.map((position) =>
+        keyed(
+          position.symbol,
+          html`
+            <div class="realized-row">
+              <div>
+                <strong>${position.symbol}</strong>
+                <span>${formatShares(position.soldShares)} sålda · ${position
+                    .isClosed
+                  ? "positionen avslutad"
+                  : `${formatShares(position.shares)} kvar`}</span>
+              </div>
+              <div class="realized-value">
+                <strong class="${toneClass(position.realized)}">${moneySigned(
+                  position.realized,
+                )}</strong>
+                <small class="${toneClass(position.realized)}">${formatPercent(
+                  position.realizedPercent,
+                )}</small>
+              </div>
+            </div>
+          `,
+        )
+      )}
+    </div>
+  `;
+}
+
 function moverCard(label, position) {
   return html`
     <article class="mover-card">
       <span>${label}</span>
       <strong>${position.symbol}</strong>
       <p class="${toneClass(position.gain)}">
-        ${formatCurrency(position.gain)} ${formatPercent(position.gainPercent)}
+        ${moneySigned(position.gain)} ${formatPercent(position.gainPercent)}
       </p>
     </article>
   `;
@@ -1254,6 +3675,9 @@ function validateImport(data) {
   }
   if (!Array.isArray(data.lots)) {
     throw new Error("Importfilen saknar köp.");
+  }
+  if (data.sales !== undefined && !Array.isArray(data.sales)) {
+    throw new Error("Importfilens försäljningar har fel format.");
   }
   if (!Array.isArray(data.watchlist)) {
     throw new Error("Importfilen saknar bevakningslista.");

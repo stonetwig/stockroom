@@ -1,3 +1,7 @@
+import { createSyncServer } from "./sync/server.ts";
+import { denoKvAdapter } from "./sync/deno-kv.ts";
+import { PROTOCOL_VERSION } from "./sync/protocol.ts";
+
 const PUBLIC_DIR = new URL("../public/", import.meta.url);
 const PORT = Number(Deno.env.get("PORT") ?? "8000");
 const USER_AGENT =
@@ -14,7 +18,30 @@ const MIME_TYPES = {
   ".ico": "image/x-icon",
 };
 
+/* ------------------------------------------------------------------------ */
+/* Price history: cached in Deno KV, synced to browsers via BedrockJS sync   */
+/* ------------------------------------------------------------------------ */
+
+const HISTORY_MODEL = "history";
+const HISTORY_RANGE = "5y";
+const HISTORY_INTERVAL = "1d";
+// A daily series only really changes once per trading day; the browser lays
+// the live quote over the last bar, so a few hours of staleness is fine.
+const HISTORY_TTL_MS = 6 * 60 * 60 * 1000;
+// Deno KV values are capped at 64 KiB; leave headroom for the row envelope.
+const MAX_POINTS_JSON_BYTES = 56 * 1024;
+const SYNC_SCOPE = "";
+
+const kv = await Deno.openKv(Deno.env.get("STOCKROOM_KV_PATH") || undefined);
+const storage = compactingStorage(denoKvAdapter({ kv }), kv);
+const syncHandler = await createSyncServer({
+  storage,
+  models: [HISTORY_MODEL],
+  basePath: "/sync",
+});
+
 const cache = new Map();
+const inflightHistories = new Map();
 
 Deno.serve({ port: PORT }, async (request) => {
   const url = new URL(request.url);
@@ -24,6 +51,7 @@ Deno.serve({ port: PORT }, async (request) => {
   }
 
   try {
+    if (url.pathname.startsWith("/sync/")) return await syncHandler(request);
     if (url.pathname === "/api/quotes") return await handleQuotes(url);
     if (url.pathname === "/api/search") return await handleSearch(url);
     if (url.pathname === "/api/history") return await handleHistory(url);
@@ -104,35 +132,176 @@ async function handleSearch(url) {
   });
 }
 
+/**
+ * GET /api/history?symbol=AAPL[&refresh=1]
+ *
+ * Makes sure the symbol's five year daily series is cached in Deno KV and
+ * returns the synced row. Writing the row goes through the sync server, so
+ * every connected browser receives it over SSE at the same time.
+ */
 async function handleHistory(url) {
   const symbol = normalizeSymbol(url.searchParams.get("symbol"));
   if (!symbol) return json({ error: "Symbol saknas" }, { status: 400 });
 
-  const range = sanitizeChoice(url.searchParams.get("range"), [
-    "1mo",
-    "3mo",
-    "6mo",
-    "1y",
-    "2y",
-    "5y",
-  ], "6mo");
-  const interval = sanitizeChoice(url.searchParams.get("interval"), [
-    "1d",
-    "1wk",
-    "1mo",
-  ], "1d");
-
-  const history = await cached(
-    `history:${symbol}:${range}:${interval}`,
-    10 * 60_000,
-    () => yahooHistory(symbol, range, interval),
-  );
-
-  return json(history, {
-    headers: {
-      "Cache-Control": "public, max-age=120, stale-while-revalidate=600",
-    },
+  const result = await ensureHistoryRow(symbol, {
+    refresh: url.searchParams.get("refresh") === "1",
   });
+  return json(result, { headers: { "Cache-Control": "no-store" } });
+}
+
+async function ensureHistoryRow(symbol, options = {}) {
+  const existing = await storage.get(SYNC_SCOPE, HISTORY_MODEL, symbol);
+  const live = existing && !existing.deletedAt ? existing : null;
+  const ageMs = live
+    ? Date.now() - (Date.parse(live.data?.updatedAt ?? "") || 0)
+    : Infinity;
+
+  if (live && !options.refresh && ageMs < HISTORY_TTL_MS) {
+    return {
+      symbol,
+      row: live,
+      cursor: await storage.currentCursor(SYNC_SCOPE, HISTORY_MODEL),
+      refreshed: false,
+      stale: false,
+    };
+  }
+
+  if (inflightHistories.has(symbol)) return inflightHistories.get(symbol);
+
+  const task = (async () => {
+    try {
+      const data = await yahooSeries(symbol);
+      const result = await applySyncOp(
+        HISTORY_MODEL,
+        symbol,
+        live ? { type: "update", patch: data } : { type: "create", data },
+      );
+      return {
+        symbol,
+        row: result.row,
+        cursor: result.cursor,
+        refreshed: true,
+        stale: false,
+      };
+    } catch (error) {
+      if (!live) throw error;
+      console.warn(`Kurshistorik för ${symbol}: ${error.message}`);
+      return {
+        symbol,
+        row: live,
+        cursor: await storage.currentCursor(SYNC_SCOPE, HISTORY_MODEL),
+        refreshed: false,
+        stale: true,
+        error: error.message,
+      };
+    } finally {
+      inflightHistories.delete(symbol);
+    }
+  })();
+
+  inflightHistories.set(symbol, task);
+  return task;
+}
+
+/** Apply one mutation through the sync server (stores + broadcasts). */
+async function applySyncOp(model, id, op) {
+  const request = new Request(
+    `http://stockroom.internal/sync/${encodeURIComponent(model)}/ops`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        protocol: PROTOCOL_VERSION,
+        ops: [{
+          opId: crypto.randomUUID(),
+          model,
+          id,
+          clientTs: Date.now(),
+          ...op,
+        }],
+      }),
+    },
+  );
+  const response = await syncHandler(request);
+  const payload = await response.json();
+  const result = payload.results?.[0];
+  if (!response.ok || !result || result.status === "rejected") {
+    throw new Error(
+      result?.error ?? payload.error ?? "Synkroniseringen avvisade ändringen",
+    );
+  }
+  return result;
+}
+
+/**
+ * The Deno KV adapter appends every change to a log that is replayed to new
+ * clients. History rows are rewritten a few times a day, so drop the previous
+ * log entry of a row once a newer one exists: clients catching up still get
+ * the latest version of every row, and KV does not grow without bound.
+ */
+function compactingStorage(base, kvInstance) {
+  return {
+    ...base,
+    async appendChange(scope, model, row) {
+      const previous = await base.get(scope, model, row.id);
+      const cursor = await base.appendChange(scope, model, row);
+      if (previous?.rev && previous.rev !== cursor) {
+        await kvInstance.delete([
+          "bedrockjs",
+          scope,
+          model,
+          "log",
+          previous.rev,
+        ]);
+      }
+      return cursor;
+    },
+  };
+}
+
+/** Compact daily closes for a symbol: `[[date, close], ...]` as JSON. */
+async function yahooSeries(symbol) {
+  const payload = await yahooChart(symbol, HISTORY_RANGE, HISTORY_INTERVAL);
+  const chart = firstChart(payload, symbol);
+  const meta = chart.meta ?? {};
+  const closes = chart.indicators?.quote?.[0]?.close ?? [];
+  const timestamps = chart.timestamp ?? [];
+
+  const points = [];
+  for (let index = 0; index < timestamps.length; index += 1) {
+    const close = finite(closes[index]);
+    if (!Number.isFinite(close) || close <= 0) continue;
+    const date = new Date(timestamps[index] * 1000).toISOString().slice(0, 10);
+    const rounded = Math.round(close * 10_000) / 10_000;
+    if (points.length && points.at(-1)[0] === date) {
+      points[points.length - 1][1] = rounded;
+    } else {
+      points.push([date, rounded]);
+    }
+  }
+  if (points.length === 0) {
+    throw new Error(`Ingen kurshistorik returnerades för ${symbol}`);
+  }
+
+  let encoded = JSON.stringify(points);
+  while (encoded.length > MAX_POINTS_JSON_BYTES && points.length > 50) {
+    points.splice(0, Math.ceil(points.length * 0.1));
+    encoded = JSON.stringify(points);
+  }
+
+  return {
+    symbol: String(meta.symbol || symbol).toUpperCase(),
+    name: meta.longName || meta.shortName ||
+      String(meta.symbol || symbol).toUpperCase(),
+    currency: meta.currency || "",
+    interval: HISTORY_INTERVAL,
+    from: points[0][0],
+    to: points.at(-1)[0],
+    count: points.length,
+    points: encoded,
+    updatedAt: new Date().toISOString(),
+    source: "Yahoo Finance chart",
+  };
 }
 
 async function yahooChartQuote(symbol) {
@@ -171,31 +340,6 @@ async function yahooChartQuote(symbol) {
     fiftyTwoWeekHigh: finite(meta.fiftyTwoWeekHigh),
     fiftyTwoWeekLow: finite(meta.fiftyTwoWeekLow),
     volume: finite(meta.regularMarketVolume),
-    source: "Yahoo Finance chart",
-  };
-}
-
-async function yahooHistory(symbol, range, interval) {
-  const payload = await yahooChart(symbol, range, interval);
-  const chart = firstChart(payload, symbol);
-  const quote = chart.indicators?.quote?.[0] ?? {};
-  const timestamps = chart.timestamp ?? [];
-
-  const points = timestamps.map((timestamp, index) => ({
-    date: new Date(timestamp * 1000).toISOString().slice(0, 10),
-    open: finite(quote.open?.[index]),
-    high: finite(quote.high?.[index]),
-    low: finite(quote.low?.[index]),
-    close: finite(quote.close?.[index]),
-    volume: finite(quote.volume?.[index]),
-  })).filter((point) => Number.isFinite(point.close));
-
-  return {
-    symbol: String(chart.meta?.symbol || symbol).toUpperCase(),
-    range,
-    interval,
-    points,
-    updatedAt: new Date().toISOString(),
     source: "Yahoo Finance chart",
   };
 }
@@ -302,11 +446,10 @@ function normalizeSymbol(value) {
   return symbol;
 }
 
-function sanitizeChoice(value, choices, fallback) {
-  return choices.includes(value) ? value : fallback;
-}
-
 function finite(value) {
+  // Yahoo sends `null` for bars without data; Number(null) is 0, which would
+  // otherwise turn a missing bar into a "price dropped to zero" point.
+  if (value === null || value === undefined || value === "") return undefined;
   const number = Number(value);
   return Number.isFinite(number) ? number : undefined;
 }

@@ -18,17 +18,6 @@ export async function fetchQuotes(symbols) {
   );
 }
 
-export async function fetchHistory(symbol, range = "6mo") {
-  const cleanSymbol = normalizeSymbol(symbol);
-  if (!cleanSymbol) throw new Error("Symbol saknas");
-
-  return await getJson(
-    `/api/history?symbol=${
-      encodeURIComponent(cleanSymbol)
-    }&range=${range}&interval=1d`,
-  );
-}
-
 export async function searchSymbols(query) {
   const cleanQuery = query.trim();
   if (!cleanQuery) return [];

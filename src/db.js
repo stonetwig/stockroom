@@ -1,20 +1,30 @@
 const DB_NAME = "stockroom-local-device";
-const DB_VERSION = 1;
-const STORE_NAMES = ["lots", "watchlist", "quotes", "histories", "settings"];
+const DB_VERSION = 2;
+const STORE_NAMES = [
+  "lots",
+  "sales",
+  "watchlist",
+  "quotes",
+  "histories",
+  "settings",
+];
 
 let dbPromise;
 
 export async function loadLocalData() {
-  const [lots, watchlist, quotes, histories, settingsRows] = await Promise.all([
-    getAll("lots"),
-    getAll("watchlist"),
-    getAll("quotes"),
-    getAll("histories"),
-    getAll("settings"),
-  ]);
+  const [lots, sales, watchlist, quotes, histories, settingsRows] =
+    await Promise.all([
+      getAll("lots"),
+      getAll("sales"),
+      getAll("watchlist"),
+      getAll("quotes"),
+      getAll("histories"),
+      getAll("settings"),
+    ]);
 
   return {
     lots: lots.sort((a, b) => b.purchasedAt.localeCompare(a.purchasedAt)),
+    sales: sales.sort((a, b) => b.soldAt.localeCompare(a.soldAt)),
     watchlist: watchlist.sort((a, b) => a.symbol.localeCompare(b.symbol)),
     quotes: Object.fromEntries(quotes.map((quote) => [quote.symbol, quote])),
     histories: Object.fromEntries(
@@ -32,6 +42,14 @@ export async function saveLot(lot) {
 
 export async function removeLot(id) {
   await deleteRecord("lots", id);
+}
+
+export async function saveSale(sale) {
+  await put("sales", sale);
+}
+
+export async function removeSale(id) {
+  await deleteRecord("sales", id);
 }
 
 export async function saveWatchSymbol(record) {
@@ -65,6 +83,7 @@ export async function replaceAllData(data) {
     for (const name of STORE_NAMES) tx.objectStore(name).clear();
 
     for (const lot of asArray(data.lots)) tx.objectStore("lots").put(lot);
+    for (const sale of asArray(data.sales)) tx.objectStore("sales").put(sale);
     for (const item of asArray(data.watchlist)) {
       tx.objectStore("watchlist").put(item);
     }
@@ -127,8 +146,24 @@ function openDatabase() {
   if (!dbPromise) {
     dbPromise = new Promise((resolve, reject) => {
       const request = indexedDB.open(DB_NAME, DB_VERSION);
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => {
+        dbPromise = undefined;
+        reject(request.error);
+      };
+      request.onblocked = () => {
+        console.warn(
+          "Stockroom: databasen uppgraderas men en annan flik håller den öppen.",
+        );
+      };
+      request.onsuccess = () => {
+        const db = request.result;
+        // Let another tab upgrade the schema without getting blocked by us.
+        db.onversionchange = () => {
+          db.close();
+          dbPromise = undefined;
+        };
+        resolve(db);
+      };
       request.onupgradeneeded = () => {
         const db = request.result;
 
@@ -136,6 +171,13 @@ function openDatabase() {
           const store = db.createObjectStore("lots", { keyPath: "id" });
           store.createIndex("symbol", "symbol", { unique: false });
           store.createIndex("purchasedAt", "purchasedAt", { unique: false });
+        }
+
+        // v2: sales ledger. Created for fresh installs and v1 upgrades alike.
+        if (!db.objectStoreNames.contains("sales")) {
+          const store = db.createObjectStore("sales", { keyPath: "id" });
+          store.createIndex("symbol", "symbol", { unique: false });
+          store.createIndex("soldAt", "soldAt", { unique: false });
         }
 
         if (!db.objectStoreNames.contains("watchlist")) {
