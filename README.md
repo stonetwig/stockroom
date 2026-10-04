@@ -4,7 +4,7 @@ A Deno + BedrockJS stock portfolio tracker. The backend fetches market data from
 Yahoo Finance chart/search endpoints and caches price histories in **Deno KV**,
 streaming them to every browser through the BedrockJS sync layer. Purchases,
 sales, watchlist, quote snapshots and settings are stored locally in the browser
-with IndexedDB.
+with IndexedDB. The interface is available in all 24 official EU languages.
 
 ## Features
 
@@ -26,14 +26,53 @@ with IndexedDB.
   details, and a per-trade "price since the trade" list to judge timing.
 - **Transactions page** – one chronological ledger of buys and sells with type
   and symbol filters, invested/sold/realized totals, and delete.
+- **24 languages** – Swedish by default, or the browser's preferred language
+  when it is one of the official EU languages. The globe button in the top bar
+  switches language at any time and the choice is remembered. Numbers, dates and
+  currencies follow the chosen language. See [Languages](#languages).
 - **Server-cached, synced price history** – the server keeps one compact five
   year daily series per symbol in Deno KV (refreshed at most every six hours)
   and publishes it through `/sync/history/*` (BedrockJS sync: SSE stream +
   IndexedDB on the client). Charts, sparklines and historical price/FX lookups
   all read the synced model, and the live quote is laid over today's bar.
 
-All amounts are formatted with `Intl.NumberFormat`. Foreign quotes are converted
-in the browser from cached Yahoo Finance FX pairs such as `USDSEK=X`.
+All amounts are formatted with `Intl.NumberFormat` in the UI language. Foreign
+quotes are converted in the browser from cached Yahoo Finance FX pairs such as
+`USDSEK=X`.
+
+## Languages
+
+The UI is translated into the 24 official EU languages (listed in
+`src/languages.js`, in EU protocol order). The starting language is chosen as
+follows:
+
+1. A language picked with the globe button (saved in `localStorage` under
+   `stockroom.language`).
+2. Otherwise the first of the browser's preferred languages
+   (`navigator.languages`) that is an EU language – `de-AT` gives German,
+   `nb-NO, en-GB` gives English.
+3. Otherwise Swedish.
+
+Translations live in `public/locales/<code>.json` as flat key → text maps with
+`{placeholder}` interpolation and CLDR plural forms (`one`, `few`, `many`, …
+picked with `Intl.PluralRules`). Swedish (`sv.json`) is the source catalog: it
+is bundled into `public/app.js`, and any key missing from another catalog falls
+back to it. Other catalogs are fetched once, when first needed; on the first
+visit the app waits up to 2.5 s for that file before rendering in Swedish and
+switching when it arrives.
+
+Number and date formatting uses the browser's own regional variant when it
+prefers the chosen language (`en-US`, `de-AT` …), otherwise the language's
+default locale. Irish and Maltese fall back to `en-IE`/`en-MT` formatting where
+the browser has no locale data for them (Chromium).
+
+API errors carry a stable `code` next to the (Swedish) `error`/`message` text,
+for example `{"error": "…", "code": "noMarketData", "symbol": "XYZ"}`; the
+browser shows the matching `server.<code>` translation.
+
+To add or change a string, edit `sv.json` and every other catalog, then run
+`deno task test`: it checks that all catalogs have the same keys and
+placeholders as `sv.json` and every plural form their language needs.
 
 ## Data model
 
@@ -117,6 +156,7 @@ SQLite file – then also grant `--allow-read`/`--allow-write` for that path).
 ```sh
 deno task build
 deno task check
+deno task test
 deno task fmt
 ```
 

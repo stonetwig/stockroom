@@ -1,3 +1,5 @@
+import { t, translateServerError } from "./i18n.js";
+
 const REQUEST_TIMEOUT_MS = 12_000;
 
 export function normalizeSymbol(value) {
@@ -39,15 +41,28 @@ async function getJson(path) {
     });
     const text = await response.text();
     if (!response.ok) {
-      throw new Error(text || `Förfrågan misslyckades med ${response.status}`);
+      throw new Error(
+        translateServerError(
+          parseJson(text),
+          t("errors.requestFailed", { status: String(response.status) }),
+        ),
+      );
     }
     return JSON.parse(text);
   } catch (error) {
     if (error.name === "AbortError") {
-      throw new Error("Förfrågan om marknadsdata tog för lång tid");
+      throw new Error(t("errors.timeout"));
     }
     throw error;
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+export function parseJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
   }
 }

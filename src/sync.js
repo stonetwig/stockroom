@@ -8,7 +8,8 @@
  * the reactive synced model (`historySeries`).
  */
 import { createSyncClient, defineSyncedModel } from "@rendly/bedrockjs/sync";
-import { normalizeSymbol } from "./market.js";
+import { t, translateServerError } from "./i18n.js";
+import { normalizeSymbol, parseJson } from "./market.js";
 
 export const HISTORY_MODEL = "history";
 const SYNC_DB_NAME = "stockroom-sync";
@@ -55,7 +56,7 @@ const requests = new Map();
  */
 export function ensureHistory(symbol, options = {}) {
   const key = normalizeSymbol(symbol);
-  if (!key) return Promise.reject(new Error("Symbol saknas"));
+  if (!key) return Promise.reject(new Error(t("server.symbolMissing")));
 
   const pending = requests.get(key);
   const maxAgeMs = options.maxAgeMs ?? REQUEST_TTL_MS;
@@ -72,8 +73,13 @@ export function ensureHistory(symbol, options = {}) {
     const text = await response.text();
     if (!response.ok) {
       throw new Error(
-        errorMessage(text) ??
-          `Kurshistorik för ${key} kunde inte hämtas (${response.status})`,
+        translateServerError(
+          parseJson(text),
+          t("errors.historyFailed", {
+            symbol: key,
+            status: String(response.status),
+          }),
+        ),
       );
     }
 
@@ -180,14 +186,5 @@ function parsePoints(json) {
       );
   } catch {
     return [];
-  }
-}
-
-function errorMessage(text) {
-  try {
-    const parsed = JSON.parse(text);
-    return typeof parsed?.error === "string" ? parsed.error : null;
-  } catch {
-    return text || null;
   }
 }

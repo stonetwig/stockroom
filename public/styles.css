@@ -149,7 +149,10 @@ svg {
   top: 0;
   z-index: 20;
   display: grid;
-  grid-template-columns: minmax(200px, 1fr) auto minmax(220px, 1fr);
+  /* The side columns never shrink below their content; when space runs out
+     (long translations) the tabs scroll instead of overlapping them. */
+  grid-template-columns:
+    minmax(min-content, 1fr) minmax(0, auto) minmax(max-content, 1fr);
   align-items: center;
   gap: 18px;
   padding: 12px 0;
@@ -238,6 +241,7 @@ router-link.brand-link:hover .brand-title {
 .nav-tabs {
   display: flex;
   gap: 6px;
+  overflow-x: auto;
   padding: 4px;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -330,6 +334,95 @@ router-link.row-link:hover strong {
   min-width: 112px;
 }
 
+language-picker {
+  position: relative;
+  display: block;
+}
+
+.language-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 11px;
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.language-button svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+}
+
+.language-button span {
+  color: var(--ink);
+}
+
+.language-button[aria-expanded="true"] {
+  border-color: var(--line-strong);
+  background: var(--surface-muted);
+}
+
+.language-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 30;
+  display: grid;
+  grid-auto-flow: column;
+  grid-template-rows: repeat(12, auto);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 2px 6px;
+  width: 340px;
+  max-width: calc(100vw - 20px);
+  max-height: min(70vh, 480px);
+  overflow-y: auto;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.language-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 34px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  font-size: 0.9rem;
+  text-align: left;
+}
+
+.language-option:hover {
+  background: var(--surface-muted);
+}
+
+.language-option small {
+  color: var(--faint);
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.language-option.active {
+  background: var(--ink);
+  color: var(--surface);
+}
+
+.language-option.active small {
+  color: inherit;
+  opacity: 0.7;
+}
+
 .workspace {
   padding-top: 22px;
 }
@@ -372,7 +465,7 @@ router-link.row-link:hover strong {
 .summary-band {
   grid-column: 1 / -1;
   display: grid;
-  grid-template-columns: 1.4fr repeat(4, 1fr);
+  grid-template-columns: minmax(0, 1.4fr) repeat(4, minmax(0, 1fr));
   gap: 12px;
 }
 
@@ -391,6 +484,7 @@ router-link.row-link:hover strong {
   padding: 18px;
   min-height: 124px;
   align-content: start;
+  container-type: inline-size;
 }
 
 .primary-metric {
@@ -422,7 +516,8 @@ router-link.row-link:hover strong {
 }
 
 .metric strong {
-  font-size: 1.65rem;
+  /* Shrinks in narrow cards so long amounts ("+SEK 58,031") still fit. */
+  font-size: min(1.65rem, 14cqi);
   line-height: 1.05;
   font-variant-numeric: tabular-nums;
 }
@@ -443,9 +538,16 @@ router-link.row-link:hover strong {
 }
 
 .panel-heading {
+  flex-wrap: wrap;
   justify-content: space-between;
   gap: 18px;
   margin-bottom: 16px;
+}
+
+/* Grows beside the heading's button and only wraps it onto a new line when
+   even the longest word would not fit next to it. */
+.panel-heading > div {
+  flex: 1 1 min-content;
 }
 
 .panel-heading h1,
@@ -560,7 +662,8 @@ label {
 }
 
 .input-action button {
-  flex: 0 0 76px;
+  flex: 0 0 auto;
+  min-width: 76px;
 }
 
 .form-actions {
@@ -1002,6 +1105,7 @@ label {
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: #fff;
+  container-type: inline-size;
 }
 
 .watch-card-head {
@@ -1038,6 +1142,23 @@ label {
 .watch-stats span {
   display: grid;
   gap: 4px;
+  min-width: 0;
+}
+
+.watch-stats small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* Room for diacritics above capitals (Ö, Å) inside the clipped box. */
+  line-height: 1.5;
+}
+
+/* Narrow cards: two stats per row so long amounts ("SEK 314.80") do not
+   run into each other. */
+@container (max-width: 330px) {
+  .watch-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 .watch-stats em {
@@ -1636,6 +1757,7 @@ label {
   }
 
   .topbar-actions {
+    position: relative;
     justify-self: stretch;
     justify-content: space-between;
   }
@@ -1644,8 +1766,11 @@ label {
     flex: 1;
   }
 
-  .nav-tabs {
-    overflow-x: auto;
+  /* The menu aligns with the full-width action row instead of the button,
+     so it stays on screen when the row wraps. */
+  language-picker {
+    position: static;
+    margin-left: auto;
   }
 
   .position-row,

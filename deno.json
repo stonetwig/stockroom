@@ -7,6 +7,7 @@
     "build": "deno bundle --platform browser --minify --sourcemap=linked src/browser-app.js -o public/app.js",
     "check": "deno check server/main.js src/app.js src/browser-app.js src/sync.js",
     "fmt": "deno fmt",
+    "test": "deno test --allow-read=public/locales src/",
     "serve": "deno task build && deno run --allow-net --allow-read=public --allow-env=PORT,STOCKROOM_KV_PATH,STOCKROOM_REFRESH_CRON server/main.js"
   },
   "imports": {

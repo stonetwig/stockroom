@@ -19,6 +19,17 @@ export const TRADE_CURRENCIES = [
 /** Currencies the whole portfolio can be viewed in. */
 export const VIEW_CURRENCIES = ["SEK", "EUR", "USD"];
 
+/** Locale every formatter below uses; follows the UI language (i18n.js). */
+let formatLocale = "sv-SE";
+
+export function setFormatLocale(locale) {
+  formatLocale = locale;
+}
+
+export function getFormatLocale() {
+  return formatLocale;
+}
+
 /** SEK per one unit of the trade currency on the trade date (1 for SEK). */
 export function tradeFxRate(record) {
   const rate = Number(record?.fxRate);
@@ -338,7 +349,7 @@ export function summarizePortfolio(positions) {
 export function formatCurrency(value, currency = DISPLAY_CURRENCY) {
   const amount = Number.isFinite(value) ? value : 0;
   try {
-    return new Intl.NumberFormat("sv-SE", {
+    return new Intl.NumberFormat(formatLocale, {
       style: "currency",
       currency,
       maximumFractionDigits: Math.abs(amount) >= 1000 ? 0 : 2,
@@ -382,7 +393,7 @@ export function currencyRateToSek(currency, fxRates = {}) {
 
 export function formatNumber(value, digits = 2) {
   const number = Number.isFinite(value) ? value : 0;
-  return new Intl.NumberFormat("sv-SE", {
+  return new Intl.NumberFormat(formatLocale, {
     minimumFractionDigits: digits,
     maximumFractionDigits: digits,
   }).format(number);
@@ -391,7 +402,7 @@ export function formatNumber(value, digits = 2) {
 /** Share counts: "12", "12,5" or "0,3333" – never "12,0000". */
 export function formatShares(value) {
   const number = Number.isFinite(value) ? value : 0;
-  return new Intl.NumberFormat("sv-SE", {
+  return new Intl.NumberFormat(formatLocale, {
     minimumFractionDigits: 0,
     maximumFractionDigits: 4,
   }).format(number);
@@ -400,7 +411,7 @@ export function formatShares(value) {
 export function formatPercent(value) {
   const number = Number.isFinite(value) ? value : 0;
   return `${
-    new Intl.NumberFormat("sv-SE", {
+    new Intl.NumberFormat(formatLocale, {
       // No "−0,00%" for changes that round to zero.
       signDisplay: "exceptZero",
       minimumFractionDigits: 2,
@@ -413,7 +424,7 @@ export function formatDate(value) {
   if (!value) return "–";
   const date = new Date(`${value}T00:00:00`);
   if (Number.isNaN(date.getTime())) return String(value);
-  return new Intl.DateTimeFormat("sv-SE", {
+  return new Intl.DateTimeFormat(formatLocale, {
     day: "numeric",
     month: "short",
     year: "numeric",

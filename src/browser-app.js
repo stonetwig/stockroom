@@ -21,6 +21,16 @@ import {
   saveSetting,
   saveWatchSymbol,
 } from "./db.js";
+import {
+  currentLanguage,
+  initLanguage,
+  languageName,
+  languageReady,
+  setLanguage,
+  t,
+  translateServerError,
+} from "./i18n.js";
+import { LANGUAGES } from "./languages.js";
 import { fetchQuotes, normalizeSymbol, searchSymbols } from "./market.js";
 import {
   ensureHistory,
@@ -41,6 +51,7 @@ import {
   formatPercent,
   formatShares,
   formatSignedCurrency,
+  getFormatLocale,
   minorUnit,
   normalizeCurrency,
   previewSale,
@@ -81,15 +92,11 @@ const state = reactive({
   historyStatus: {},
 });
 
+// Before anything renders: pick the UI language and start loading it.
+void initLanguage();
+
 RouterLink.register();
 RouterOutlet.register();
-
-const PROMO_TEXT = (() => {
-  const language = navigator.languages?.[0] ?? navigator.language ?? "";
-  return language.toLowerCase().startsWith("sv")
-    ? { lead: "Vill du ha en bättre budgetapp?", link: "Testa Sambokoll" }
-    : { lead: "Want a better budgeting app?", link: "Try Sambokoll" };
-})();
 
 class AppRoot extends Component {
   static tag = "app-root";
@@ -99,20 +106,27 @@ class AppRoot extends Component {
   };
 
   render() {
+    // Wait (briefly) for a downloaded language instead of flashing Swedish.
+    if (!languageReady()) {
+      return html`
+        <div class="app-shell"></div>
+      `;
+    }
+
     const current = displayCurrency();
     return html`
       <div class="app-shell">
         <aside class="promo-strip">
-          <span>${PROMO_TEXT.lead}</span>
+          <span>${t("app.promoLead")}</span>
           <a
             href="https://sambokoll.se"
             target="_blank"
             rel="noopener"
-          >${PROMO_TEXT.link} →</a>
+          >${t("app.promoLink")} →</a>
         </aside>
 
         <header class="topbar">
-          <router-link class="brand-link" to="/" title="Till översikten">
+          <router-link class="brand-link" to="/" title="${t("app.home")}">
             <span class="brand-block">
               <img
                 class="brand-logo"
@@ -123,21 +137,27 @@ class AppRoot extends Component {
               />
               <span class="brand-text">
                 <span class="brand-title">Stockroom</span>
-                <span class="brand-subtitle">portfölj på enheten</span>
+                <span class="brand-subtitle">${t("app.subtitle")}</span>
               </span>
             </span>
           </router-link>
 
           <nav class="nav-tabs">
-            <router-link to="/">Översikt</router-link>
-            <router-link to="/holdings">Innehav</router-link>
-            <router-link to="/transactions">Transaktioner</router-link>
-            <router-link to="/research">Sök</router-link>
-            <router-link to="/settings">Inställningar</router-link>
+            <router-link to="/">${t("nav.overview")}</router-link>
+            <router-link to="/holdings">${t("nav.holdings")}</router-link>
+            <router-link to="/transactions">${t(
+              "nav.transactions",
+            )}</router-link>
+            <router-link to="/research">${t("nav.search")}</router-link>
+            <router-link to="/settings">${t("nav.settings")}</router-link>
           </nav>
 
           <div class="topbar-actions">
-            <div class="segmented" role="group" aria-label="Visningsvaluta">
+            <div
+              class="segmented"
+              role="group"
+              aria-label="${t("currency.display")}"
+            >
               ${VIEW_CURRENCIES.map((currency) =>
                 keyed(
                   currency,
@@ -148,7 +168,7 @@ class AppRoot extends Component {
                         current === currency ? "active" : ""
                       }`}"
                       aria-pressed="${current === currency}"
-                      title="${`Visa portföljen i ${currency}`}"
+                      title="${t("currency.showIn", { currency })}"
                       on-click="${() => setDisplayCurrency(currency)}"
                     >
                       ${currency}
@@ -162,8 +182,9 @@ class AppRoot extends Component {
               on-click="${this.refresh}"
               disabled="${state.refreshing}"
             >
-              ${state.refreshing ? "Uppdaterar" : "Uppdatera"}
+              ${state.refreshing ? t("refresh.busy") : t("refresh.idle")}
             </button>
+            <language-picker></language-picker>
           </div>
         </header>
 
@@ -171,14 +192,18 @@ class AppRoot extends Component {
           ? html`
             <div class="status-banner error">
               <span>${state.error}</span>
-              <button on-click="${() => state.error = ""}">Stäng</button>
+              <button on-click="${() => state.error = ""}">${t(
+                "common.close",
+              )}</button>
             </div>
           `
           : ""} ${state.notice
           ? html`
             <div class="status-banner notice">
               <span>${state.notice}</span>
-              <button on-click="${() => state.notice = ""}">Stäng</button>
+              <button on-click="${() => state.notice = ""}">${t(
+                "common.close",
+              )}</button>
             </div>
           `
           : ""}
@@ -189,7 +214,7 @@ class AppRoot extends Component {
               <router-outlet></router-outlet>
             `
             : html`
-              <section class="loading-panel">Laddar lokal portfölj...</section>
+              <section class="loading-panel">${t("app.loading")}</section>
             `}
         </main>
 
@@ -199,6 +224,150 @@ class AppRoot extends Component {
           `
           : ""}
       </div>
+    `;
+  }
+}
+
+/**
+ * Globe button in the top bar listing the EU languages by their own names.
+ * Works as a menu button: arrow keys move between the options and Escape
+ * closes the menu and returns focus to the button.
+ */
+class LanguagePicker extends Component {
+  static tag = "language-picker";
+  static properties = {
+    open: { type: Boolean, default: false },
+  };
+
+  #focusMenu = false;
+
+  disconnectedCallback() {
+    this.stopListening();
+    super.disconnectedCallback();
+  }
+
+  toggle = () => {
+    if (this.open) this.close();
+    else this.show();
+  };
+
+  show() {
+    this.open = true;
+    this.#focusMenu = true;
+    document.addEventListener("pointerdown", this.handleOutside, true);
+  }
+
+  close(restoreFocus = false) {
+    this.open = false;
+    this.stopListening();
+    if (restoreFocus) this.querySelector(".language-button")?.focus();
+  }
+
+  stopListening() {
+    document.removeEventListener("pointerdown", this.handleOutside, true);
+  }
+
+  handleOutside = (event) => {
+    if (!this.contains(event.target)) this.close();
+  };
+
+  handleButtonKeydown = (event) => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      if (!this.open) this.show();
+    }
+  };
+
+  handleMenuKeydown = (event) => {
+    const options = [...this.querySelectorAll(".language-option")];
+    const index = options.indexOf(document.activeElement);
+    const last = options.length - 1;
+    const next = {
+      ArrowDown: index >= last ? 0 : index + 1,
+      ArrowUp: index <= 0 ? last : index - 1,
+      Home: 0,
+      End: last,
+    }[event.key];
+
+    if (next !== undefined) {
+      event.preventDefault();
+      options[next].focus();
+    } else if (event.key === "Escape" || event.key === "Tab") {
+      event.preventDefault();
+      this.close(true);
+    }
+  };
+
+  choose = async (code) => {
+    this.close(true);
+    try {
+      await setLanguage(code);
+    } catch {
+      state.error = t("language.loadFailed", { language: languageName(code) });
+    }
+  };
+
+  updated() {
+    if (!this.open || !this.#focusMenu) return;
+    this.#focusMenu = false;
+    const option = this.querySelector(".language-option.active") ??
+      this.querySelector(".language-option");
+    option?.focus();
+  }
+
+  render() {
+    const current = currentLanguage();
+    const label = `${t("language.label")}: ${languageName(current)}`;
+    return html`
+      <button
+        type="button"
+        class="language-button"
+        aria-haspopup="menu"
+        aria-expanded="${String(this.open)}"
+        aria-label="${label}"
+        title="${label}"
+        on-click="${this.toggle}"
+        on-keydown="${this.handleButtonKeydown}"
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="12" cy="12" r="9"></circle>
+          <path
+            d="M3 12h18M12 3c2.4 2.5 3.6 5.5 3.6 9s-1.2 6.5-3.6 9c-2.4-2.5-3.6-5.5-3.6-9S9.6 5.5 12 3z"
+          ></path>
+        </svg>
+        <span>${current.toUpperCase()}</span>
+      </button>
+      ${this.open
+        ? html`
+          <div
+            class="language-menu"
+            role="menu"
+            aria-label="${t("language.menu")}"
+            on-keydown="${this.handleMenuKeydown}"
+          >
+            ${LANGUAGES.map((language) =>
+              keyed(
+                language.code,
+                html`
+                  <button
+                    type="button"
+                    role="menuitemradio"
+                    class="${`language-option ${
+                      language.code === current ? "active" : ""
+                    }`}"
+                    aria-checked="${String(language.code === current)}"
+                    lang="${language.code}"
+                    on-click="${() => this.choose(language.code)}"
+                  >
+                    <span>${language.name}</span>
+                    <small>${language.code.toUpperCase()}</small>
+                  </button>
+                `,
+              )
+            )}
+          </div>
+        `
+        : ""}
     `;
   }
 }
@@ -218,16 +387,17 @@ class DashboardPage extends Component {
       <section class="dashboard-grid">
         <div class="summary-band">
           <article class="metric primary-metric">
-            <span class="metric-label">Portföljvärde</span>
+            <span class="metric-label">${t("dashboard.portfolioValue")}</span>
             <strong>${money(summary.totalValue)}</strong>
             <span class="${`metric-delta ${toneClass(summary.totalGain)}`}">
-              ${moneySigned(summary.totalGain)} · ${formatPercent(
-                summary.totalGainPercent,
-              )} orealiserat
+              ${t("dashboard.unrealizedDelta", {
+                amount: moneySigned(summary.totalGain),
+                percent: formatPercent(summary.totalGainPercent),
+              })}
             </span>
           </article>
           <article class="metric">
-            <span class="metric-label">Dagens rörelse</span>
+            <span class="metric-label">${t("dashboard.dayChange")}</span>
             <strong class="${toneClass(summary.dayChange)}">
               ${moneySigned(summary.dayChange)}
             </strong>
@@ -236,7 +406,7 @@ class DashboardPage extends Component {
             </span>
           </article>
           <article class="metric">
-            <span class="metric-label">Realiserat</span>
+            <span class="metric-label">${t("label.realized")}</span>
             <strong class="${toneClass(summary.realized)}">
               ${moneySigned(summary.realized)}
             </strong>
@@ -245,37 +415,37 @@ class DashboardPage extends Component {
             }`}">
               ${summary.salesCount
                 ? `${formatPercent(summary.realizedPercent)} · ${
-                  countLabel(summary.salesCount, "försäljning", "försäljningar")
+                  t("count.sales", { count: summary.salesCount })
                 }`
-                : "inga försäljningar ännu"}
+                : t("dashboard.noSalesYet")}
             </span>
           </article>
           <article class="metric">
-            <span class="metric-label">Anskaffningsvärde</span>
+            <span class="metric-label">${t("dashboard.costBasis")}</span>
             <strong>${money(summary.totalCost)}</strong>
-            <span class="metric-delta neutral">${countLabel(
-              summary.holdingsCount,
-              "innehav",
-              "innehav",
-            )}</span>
+            <span class="metric-delta neutral">${t("count.holdings", {
+              count: summary.holdingsCount,
+            })}</span>
           </article>
           <article class="metric">
-            <span class="metric-label">Totalt resultat</span>
+            <span class="metric-label">${t("dashboard.totalReturn")}</span>
             <strong class="${toneClass(summary.totalReturn)}">
               ${moneySigned(summary.totalReturn)}
             </strong>
-            <span
-              class="metric-delta neutral">realiserat + orealiserat · ${lastRefreshText()}</span>
+            <span class="metric-delta neutral">${t(
+              "dashboard.totalReturnNote",
+              { updated: lastRefreshText() },
+            )}</span>
           </article>
         </div>
 
         <section class="panel holdings-panel">
           <div class="panel-heading">
             <div>
-              <h2>Innehav</h2>
+              <h2>${t("dashboard.holdingsTitle")}</h2>
               <p>${holdings.length
-                ? "Öppna positioner sorterade efter marknadsvärde. Sälj hela eller delar av ett innehav direkt från raden."
-                : "Inga öppna innehav ännu."}</p>
+                ? t("dashboard.holdingsIntro")
+                : t("dashboard.noHoldings")}</p>
             </div>
             ${holdings.length
               ? html`
@@ -284,7 +454,7 @@ class DashboardPage extends Component {
                   class="sell-button"
                   on-click="${() => openSellDialog()}"
                 >
-                  Sälj innehav
+                  ${t("action.sellHolding")}
                 </button>
               `
               : ""}
@@ -293,19 +463,14 @@ class DashboardPage extends Component {
             ? html`
               <position-table .positions="${holdings}"></position-table>
             `
-            : emptyState(
-              "Lägg till ditt första köp för att börja följa resultatet.",
-            )}
+            : emptyState(t("dashboard.holdingsEmpty"))}
         </section>
 
         <section class="panel add-panel">
           <div class="panel-heading">
             <div>
-              <h1>Lägg till köp</h1>
-              <p>
-                Registrera symbol, antal och pris i affärens valuta. Växelkursen
-                på köpdagen hämtas automatiskt.
-              </p>
+              <h1>${t("dashboard.addTitle")}</h1>
+              <p>${t("dashboard.addIntro")}</p>
             </div>
           </div>
           <add-lot-form></add-lot-form>
@@ -314,52 +479,51 @@ class DashboardPage extends Component {
         <section class="panel allocation-panel">
           <div class="panel-heading">
             <div>
-              <h2>Fördelning</h2>
-              <p>Aktuell vikt baserad på marknadsvärde.</p>
+              <h2>${t("dashboard.allocationTitle")}</h2>
+              <p>${t("dashboard.allocationIntro")}</p>
             </div>
           </div>
           ${holdings.length
             ? allocationList(holdings, summary.totalValue)
-            : emptyState("Fördelningen visas efter minst ett sparat köp.")}
+            : emptyState(t("dashboard.allocationEmpty"))}
         </section>
 
         <section class="panel movers-panel">
           <div class="panel-heading">
             <div>
-              <h2>Utveckling</h2>
-              <p>Bästa och svagaste orealiserade avkastning.</p>
+              <h2>${t("dashboard.moversTitle")}</h2>
+              <p>${t("dashboard.moversIntro")}</p>
             </div>
           </div>
           ${summary.best
             ? html`
               <div class="mover-grid">
-                ${moverCard("Bäst", summary.best)} ${moverCard(
-                  "Svagast",
+                ${moverCard(t("dashboard.best"), summary.best)} ${moverCard(
+                  t("dashboard.worst"),
                   summary.worst,
                 )}
               </div>
             `
-            : emptyState("Utveckling visas när kurserna har laddats.")}
+            : emptyState(t("dashboard.moversEmpty"))}
         </section>
 
         <section class="panel realized-panel">
           <div class="panel-heading">
             <div>
-              <h2>Realiserat per innehav</h2>
-              <p>Resultat från försäljningar enligt genomsnittsmetoden.</p>
+              <h2>${t("dashboard.realizedTitle")}</h2>
+              <p>${t("dashboard.realizedIntro")}</p>
             </div>
             ${realizedPositions.length
               ? html`
-                <router-link class="panel-link"
-                  to="/transactions">Alla transaktioner</router-link>
+                <router-link class="panel-link" to="/transactions">${t(
+                  "dashboard.allTransactions",
+                )}</router-link>
               `
               : ""}
           </div>
           ${realizedPositions.length
             ? realizedList(realizedPositions)
-            : emptyState(
-              "Här samlas resultatet när du säljer hela eller delar av ett innehav.",
-            )}
+            : emptyState(t("dashboard.realizedEmpty"))}
         </section>
       </section>
     `;
@@ -398,15 +562,15 @@ class AddLotForm extends Component {
     const fxRate = currency === BASE_CURRENCY ? 1 : Number(this.fxRate);
 
     if (!symbol || !Number.isFinite(quantity) || quantity <= 0) {
-      this.message = "Ange en aktiesymbol och ett positivt antal aktier.";
+      this.message = t("lot.invalidInput");
       return;
     }
     if (!Number.isFinite(price) || price <= 0) {
-      this.message = `Ange köppriset per aktie i ${currency}.`;
+      this.message = t("lot.invalidPrice", { currency });
       return;
     }
     if (!Number.isFinite(fxRate) || fxRate <= 0) {
-      this.message = `Ange växelkursen (SEK per ${currency}).`;
+      this.message = t("form.invalidFxRate", { base: BASE_CURRENCY, currency });
       return;
     }
 
@@ -422,9 +586,17 @@ class AddLotForm extends Component {
         fees: Number.isFinite(fees) && fees > 0 ? fees : 0,
         note: this.note.trim(),
       });
-      this.message = `Sparade ${formatShares(quantity)} ${symbol} à ${
-        formatCurrency(price, currency)
-      }${currency === BASE_CURRENCY ? "" : ` (${money(price * fxRate)})`}.`;
+      const saved = {
+        shares: formatShares(quantity),
+        symbol,
+        price: formatCurrency(price, currency),
+      };
+      this.message = currency === BASE_CURRENCY
+        ? t("lot.saved", saved)
+        : t("lot.savedConverted", {
+          ...saved,
+          converted: money(price * fxRate),
+        });
       this.symbol = "";
       this.quantity = "";
       this.price = "";
@@ -516,7 +688,7 @@ class AddLotForm extends Component {
   fillPrice = async () => {
     const symbol = normalizeSymbol(this.symbol);
     if (!symbol) {
-      this.message = "Ange en aktiesymbol först.";
+      this.message = t("form.symbolFirst");
       return;
     }
 
@@ -578,7 +750,7 @@ class AddLotForm extends Component {
     return html`
       <form class="lot-form" novalidate on-submit="${this.submit}">
         <label class="ticker-field">
-          <span>Aktiesymbol</span>
+          <span>${t("form.symbol")}</span>
           <input
             autocomplete="off"
             inputmode="latin"
@@ -597,7 +769,9 @@ class AddLotForm extends Component {
               <div class="ticker-menu">
                 ${this.lookupLoading
                   ? html`
-                    <div class="ticker-menu-status">Söker...</div>
+                    <div class="ticker-menu-status">${t(
+                      "form.searching",
+                    )}</div>
                   `
                   : html`
                     <div class="ticker-options">
@@ -629,7 +803,7 @@ class AddLotForm extends Component {
         </label>
 
         <label>
-          <span>Antal</span>
+          <span>${t("label.quantity")}</span>
           <input
             type="number"
             min="0"
@@ -641,7 +815,7 @@ class AddLotForm extends Component {
         </label>
 
         <label>
-          <span>Pris per aktie</span>
+          <span>${t("form.pricePerShare")}</span>
           <div class="input-action">
             <input
               type="number"
@@ -654,13 +828,13 @@ class AddLotForm extends Component {
             ${currencySelect(currency, this.changeCurrency)}
             <button type="button" on-click="${this.fillPrice}" disabled="${this
               .busy}">
-              Hämta
+              ${t("form.fetch")}
             </button>
           </div>
         </label>
 
         <label>
-          <span>Datum</span>
+          <span>${t("label.date")}</span>
           <input
             type="date"
             max="${today()}"
@@ -670,7 +844,7 @@ class AddLotForm extends Component {
         </label>
 
         <label>
-          <span>Avgifter (${currency})</span>
+          <span>${t("form.fees", { currency })}</span>
           <input
             type="number"
             min="0"
@@ -683,7 +857,10 @@ class AddLotForm extends Component {
         ${foreign
           ? html`
             <label>
-              <span>Växelkurs · SEK per ${currency}</span>
+              <span>${t("form.fxRate", {
+                base: BASE_CURRENCY,
+                currency,
+              })}</span>
               <input
                 type="number"
                 min="0"
@@ -700,9 +877,9 @@ class AddLotForm extends Component {
           : ""}
 
         <label class="${foreign ? "" : "wide-field"}">
-          <span>Anteckning</span>
+          <span>${t("label.note")}</span>
           <input
-            placeholder="Mäklare, tes, konto"
+            placeholder="${t("lot.notePlaceholder")}"
             .value="${this.note}"
             on-input="${(event) => this.note = event.target.value}"
           />
@@ -710,12 +887,12 @@ class AddLotForm extends Component {
 
         <div class="form-actions">
           <button class="primary-button" type="submit" disabled="${this.busy}">
-            ${this.busy ? "Hämtar" : "Spara köp"}
+            ${this.busy ? t("lot.busy") : t("lot.submit")}
           </button>
           <p>
             ${this.message ||
               (totalSek !== null
-                ? `Totalt ${money(totalSek)}${
+                ? `${t("lot.total", { amount: money(totalSek) })}${
                   foreign
                     ? ` · ${
                       formatCurrency(
@@ -877,38 +1054,41 @@ class SellDialog extends Component {
     const fxRate = currency === BASE_CURRENCY ? 1 : Number(this.fxRate);
 
     if (!position) {
-      this.message = "Välj ett innehav att sälja.";
+      this.message = t("sell.chooseHolding");
       return;
     }
     if (!Number.isFinite(quantity) || quantity <= 0) {
-      this.message = "Ange hur många aktier du sålde.";
+      this.message = t("sell.invalidQuantity");
       return;
     }
     if (!/^\d{4}-\d{2}-\d{2}$/.test(soldAt)) {
-      this.message = "Ange ett giltigt försäljningsdatum.";
+      this.message = t("sell.invalidDate");
       return;
     }
     const available = this.available(position);
     if (quantity > available + QUANTITY_EPSILON) {
       this.message = available > 0
-        ? `Du hade bara ${
-          formatShares(available)
-        } aktier i ${position.symbol} tillgängliga ${formatDate(soldAt)}.`
-        : `Du hade inga aktier i ${position.symbol} att sälja ${
-          formatDate(soldAt)
-        }.`;
+        ? t("sell.onlyAvailable", {
+          count: available,
+          symbol: position.symbol,
+          date: formatDate(soldAt),
+        })
+        : t("sell.noneAvailable", {
+          symbol: position.symbol,
+          date: formatDate(soldAt),
+        });
       return;
     }
     if (!Number.isFinite(price) || price <= 0) {
-      this.message = `Ange försäljningspriset per aktie i ${currency}.`;
+      this.message = t("sell.invalidPrice", { currency });
       return;
     }
     if (!Number.isFinite(fxRate) || fxRate <= 0) {
-      this.message = `Ange växelkursen (SEK per ${currency}).`;
+      this.message = t("form.invalidFxRate", { base: BASE_CURRENCY, currency });
       return;
     }
     if (!Number.isFinite(fees) || fees < 0) {
-      this.message = "Avgifter kan inte vara negativa.";
+      this.message = t("sell.negativeFees");
       return;
     }
 
@@ -924,11 +1104,13 @@ class SellDialog extends Component {
         soldAt,
         note: this.note.trim(),
       });
-      state.notice = `Sålde ${formatShares(quantity)} ${position.symbol} för ${
-        money(result.netProceeds)
-      }. Realiserat resultat ${moneySigned(result.gain)} (${
-        formatPercent(result.gainPercent)
-      }).`;
+      state.notice = t("sell.notice", {
+        shares: formatShares(quantity),
+        symbol: position.symbol,
+        amount: money(result.netProceeds),
+        gain: moneySigned(result.gain),
+        percent: formatPercent(result.gainPercent),
+      });
       this.close();
     } catch (error) {
       this.message = error.message;
@@ -991,21 +1173,19 @@ class SellDialog extends Component {
       <div class="sell-form">
         <div class="sell-head">
           <div>
-            <h2 id="sell-dialog-title">Sälj innehav</h2>
-            <p>Du har inga öppna innehav att sälja ännu.</p>
+            <h2 id="sell-dialog-title">${t("action.sellHolding")}</h2>
+            <p>${t("sell.noHoldings")}</p>
           </div>
           <button
             type="button"
             class="icon-button"
-            aria-label="Stäng"
+            aria-label="${t("common.close")}"
             on-click="${this.close}"
           >
             ×
           </button>
         </div>
-        ${emptyState(
-          "Registrera ett köp först, sedan kan du sälja hela eller delar av innehavet här.",
-        )}
+        ${emptyState(t("sell.emptyHint"))}
       </div>
     `;
   }
@@ -1046,16 +1226,17 @@ class SellDialog extends Component {
       <form class="sell-form" novalidate on-submit="${this.submit}">
         <div class="sell-head">
           <div>
-            <h2 id="sell-dialog-title">Sälj ${position.symbol}</h2>
+            <h2 id="sell-dialog-title">${t("sell.title", {
+              symbol: position.symbol,
+            })}</h2>
             <p>
-              ${position.name} · Registrera en hel eller delvis försäljning.
-              Resultatet räknas i SEK med genomsnittsmetoden.
+              ${position.name} · ${t("sell.intro", { base: BASE_CURRENCY })}
             </p>
           </div>
           <button
             type="button"
             class="icon-button"
-            aria-label="Stäng"
+            aria-label="${t("common.close")}"
             on-click="${this.close}"
           >
             ×
@@ -1065,7 +1246,7 @@ class SellDialog extends Component {
         ${holdings.length > 1
           ? html`
             <label class="sell-symbol-field">
-              <span>Innehav</span>
+              <span>${t("label.holding")}</span>
               <select
                 class="sell-symbol"
                 on-change="${(event) => this.selectSymbol(event.target.value)}"
@@ -1075,8 +1256,8 @@ class SellDialog extends Component {
                     item.symbol,
                     html`
                       <option value="${item.symbol}">${`${item.symbol} · ${
-                        formatShares(item.shares)
-                      } st · ${money(item.marketValue)}`}</option>
+                        sharesText(item.shares)
+                      } · ${money(item.marketValue)}`}</option>
                     `,
                   )
                 )}
@@ -1087,26 +1268,26 @@ class SellDialog extends Component {
 
         <div class="sell-facts">
           <div class="fact">
-            <small>Innehav</small>
-            <strong>${formatShares(position.shares)} st</strong>
+            <small>${t("label.holding")}</small>
+            <strong>${sharesText(position.shares)}</strong>
             <span>${money(position.marketValue)}</span>
           </div>
           <div class="fact">
-            <small>Snittkurs</small>
+            <small>${t("label.averageCost")}</small>
             <strong>${money(position.averageCost)}</strong>
-            <span>inkl. avgifter, i SEK</span>
+            <span>${t("label.inclFeesIn", { base: BASE_CURRENCY })}</span>
           </div>
           <div class="fact">
-            <small>Kurs nu</small>
+            <small>${t("label.priceNow")}</small>
             <strong>${money(position.price)}</strong>
             <span class="${dayTone}">${showNative
               ? `${formatCurrency(quote.price, quoteCurrency)} · ${
                 formatPercent(quote?.changePercent ?? 0)
               }`
-              : `${formatPercent(quote?.changePercent ?? 0)} idag`}</span>
+              : todayChange(quote?.changePercent ?? 0)}</span>
           </div>
           <div class="fact">
-            <small>Orealiserat</small>
+            <small>${t("label.unrealized")}</small>
             <strong class="${toneClass(position.gain)}">${moneySigned(
               position.gain,
             )}</strong>
@@ -1119,15 +1300,18 @@ class SellDialog extends Component {
         <div class="sell-grid">
           <div class="quantity-field">
             <div class="field-heading">
-              <span>Antal att sälja</span>
+              <span>${t("sell.quantity")}</span>
               <span class="${oversold ? "negative" : "muted"}">
                 ${available > 0
-                  ? `Tillgängligt ${formatShares(available)} st${
-                    isToday ? "" : ` den ${formatDate(soldAt)}`
-                  }`
+                  ? isToday
+                    ? t("sell.available", { shares: sharesText(available) })
+                    : t("sell.availableOn", {
+                      shares: sharesText(available),
+                      date: formatDate(soldAt),
+                    })
                   : isToday
-                  ? "Inget tillgängligt att sälja"
-                  : `Inget tillgängligt den ${formatDate(soldAt)}`}
+                  ? t("sell.nothingAvailable")
+                  : t("sell.nothingAvailableOn", { date: formatDate(soldAt) })}
               </span>
             </div>
             <div class="quantity-controls">
@@ -1144,7 +1328,11 @@ class SellDialog extends Component {
                   this.message = "";
                 }}"
               />
-              <div class="chip-row" role="group" aria-label="Snabbval">
+              <div
+                class="chip-row"
+                role="group"
+                aria-label="${t("sell.quickPicks")}"
+              >
                 ${[0.25, 0.5, 0.75, 1].map((fraction) => {
                   const value = this.fractionQuantity(fraction, available);
                   const active = value > 0 &&
@@ -1159,8 +1347,8 @@ class SellDialog extends Component {
                         on-click="${() => this.setFraction(fraction)}"
                       >
                         ${fraction >= 1
-                          ? "Allt"
-                          : `${Math.round(fraction * 100)} %`}
+                          ? t("sell.all")
+                          : percentLabel(fraction)}
                       </button>
                     `,
                   );
@@ -1170,7 +1358,7 @@ class SellDialog extends Component {
             <input
               class="quantity-slider"
               type="range"
-              aria-label="Antal att sälja"
+              aria-label="${t("sell.quantity")}"
               min="0"
               max="${available}"
               step="${sliderStep}"
@@ -1186,7 +1374,7 @@ class SellDialog extends Component {
           </div>
 
           <label>
-            <span>Pris per aktie</span>
+            <span>${t("form.pricePerShare")}</span>
             <div class="input-action">
               <input
                 type="number"
@@ -1202,13 +1390,13 @@ class SellDialog extends Component {
                 on-click="${this.fetchPrice}"
                 disabled="${this.busy}"
               >
-                Hämta
+                ${t("form.fetch")}
               </button>
             </div>
           </label>
 
           <label>
-            <span>Datum</span>
+            <span>${t("label.date")}</span>
             <input
               type="date"
               max="${today()}"
@@ -1218,7 +1406,7 @@ class SellDialog extends Component {
           </label>
 
           <label>
-            <span>Avgifter (${currency})</span>
+            <span>${t("form.fees", { currency })}</span>
             <input
               type="number"
               min="0"
@@ -1231,7 +1419,10 @@ class SellDialog extends Component {
           ${foreign
             ? html`
               <label>
-                <span>Växelkurs · SEK per ${currency}</span>
+                <span>${t("form.fxRate", {
+                  base: BASE_CURRENCY,
+                  currency,
+                })}</span>
                 <input
                   type="number"
                   min="0"
@@ -1248,9 +1439,9 @@ class SellDialog extends Component {
             : ""}
 
           <label class="${foreign ? "wide-field" : ""}">
-            <span>Anteckning</span>
+            <span>${t("label.note")}</span>
             <input
-              placeholder="Mäklare, anledning, konto"
+              placeholder="${t("sell.notePlaceholder")}"
               .value="${this.note}"
               on-input="${(event) => this.note = event.target.value}"
             />
@@ -1261,7 +1452,7 @@ class SellDialog extends Component {
           preview ? toneClass(preview.gain) : "idle"
         }`}">
           <div>
-            <small>Erhållet netto</small>
+            <small>${t("sell.netProceeds")}</small>
             <strong>${preview ? money(preview.netProceeds) : "–"}</strong>
             <span>${preview
               ? foreign
@@ -1273,38 +1464,39 @@ class SellDialog extends Component {
                   )
                 } × ${formatNumber(fxRate, 4)}`
                 : fees > 0
-                ? `efter ${money(fees)} i avgifter`
-                : "pris × antal − avgifter"
-              : "pris × antal − avgifter"}</span>
+                ? t("sell.afterFees", { amount: money(fees) })
+                : t("sell.proceedsFormula")
+              : t("sell.proceedsFormula")}</span>
           </div>
           <div>
-            <small>Anskaffning</small>
+            <small>${t("sell.costBasis")}</small>
             <strong>${preview ? money(preview.costBasis) : "–"}</strong>
             <span>${preview
-              ? `${formatShares(roundQuantity(quantity))} × ${
-                money(preview.averageCost)
-              } snitt`
-              : "genomsnittsmetoden"}</span>
+              ? t("sell.costFormula", {
+                shares: formatShares(roundQuantity(quantity)),
+                price: money(preview.averageCost),
+              })
+              : t("sell.averageMethod")}</span>
           </div>
           <div>
-            <small>Realiserat resultat</small>
+            <small>${t("sell.realizedResult")}</small>
             <strong class="${preview ? toneClass(preview.gain) : ""}">${preview
               ? moneySigned(preview.gain)
               : "–"}</strong>
             <span class="${preview ? toneClass(preview.gain) : ""}">${preview
               ? formatPercent(preview.gainPercent)
-              : "fyll i antal och pris"}</span>
+              : t("sell.enterQuantityPrice")}</span>
           </div>
           <div>
-            <small>Kvar efteråt</small>
-            <strong>${preview
-              ? `${formatShares(preview.remainingShares)} st`
-              : `${formatShares(position.shares)} st`}</strong>
+            <small>${t("sell.remaining")}</small>
+            <strong>${sharesText(
+              preview ? preview.remainingShares : position.shares,
+            )}</strong>
             <span>${preview
               ? preview.remainingShares > QUANTITY_EPSILON
                 ? money(preview.remainingShares * position.price)
-                : "positionen avslutas"
-              : "oförändrat"}</span>
+                : t("sell.positionCloses")
+              : t("sell.unchanged")}</span>
           </div>
         </div>
 
@@ -1312,21 +1504,23 @@ class SellDialog extends Component {
           <p class="${`inline-message ${oversold ? "negative" : ""}`}">
             ${this.message ||
               (oversold
-                ? `Du kan sälja högst ${formatShares(available)} st.`
+                ? t("sell.maxQuantity", { shares: sharesText(available) })
                 : "")}
           </p>
           <div class="button-row">
-            <button type="button" on-click="${this.close}">Avbryt</button>
+            <button type="button" on-click="${this.close}">${t(
+              "common.cancel",
+            )}</button>
             <button
               type="submit"
               class="sell-button"
               disabled="${this.busy || !quantityOk || !priceOk || !fxOk}"
             >
               ${this.busy
-                ? "Sparar"
+                ? t("sell.saving")
                 : quantityOk
-                ? `Sälj ${formatShares(roundQuantity(quantity))} aktier`
-                : "Sälj"}
+                ? t("sell.submitCount", { count: roundQuantity(quantity) })
+                : t("action.sell")}
             </button>
           </div>
         </div>
@@ -1335,14 +1529,8 @@ class SellDialog extends Component {
   }
 }
 
-const CHART_RANGES = [
-  { value: "1mo", label: "1M" },
-  { value: "3mo", label: "3M" },
-  { value: "6mo", label: "6M" },
-  { value: "1y", label: "1Å" },
-  { value: "2y", label: "2Å" },
-  { value: "5y", label: "5Å" },
-];
+// Labels are the `range.<value>` translations.
+const CHART_RANGES = ["1mo", "3mo", "6mo", "1y", "2y", "5y"];
 
 const CHART = {
   width: 760,
@@ -1436,21 +1624,37 @@ class HoldingsPage extends Component {
         <aside class="panel holdings-list-panel">
           <div class="panel-heading">
             <div>
-              <h1>Innehav</h1>
-              <p>Välj ett innehav för att se kursen med dina köp och försäljningar.</p>
+              <h1>${t("holdings.title")}</h1>
+              <p>${t("holdings.intro")}</p>
             </div>
           </div>
           <input
             class="filter-input"
             type="search"
-            placeholder="Filtrera på symbol eller namn"
+            placeholder="${t("holdings.filter")}"
             .value="${this.filter}"
             on-input="${(event) => this.filter = event.target.value}"
           />
-          <div class="chip-row scope-chips" role="group" aria-label="Urval">
-            ${scopeChip(this, "holdings", `Öppna · ${holdings.length}`)}
-            ${scopeChip(this, "closed", `Avslutade · ${closed.length}`)}
-            ${scopeChip(this, "all", `Alla · ${positions.length}`)}
+          <div
+            class="chip-row scope-chips"
+            role="group"
+            aria-label="${t("holdings.scope")}"
+          >
+            ${scopeChip(
+              this,
+              "holdings",
+              `${t("holdings.scopeOpen")} · ${holdings.length}`,
+            )}
+            ${scopeChip(
+              this,
+              "closed",
+              `${t("holdings.scopeClosed")} · ${closed.length}`,
+            )}
+            ${scopeChip(
+              this,
+              "all",
+              `${t("filter.all")} · ${positions.length}`,
+            )}
           </div>
           ${listed.length
             ? html`
@@ -1461,16 +1665,14 @@ class HoldingsPage extends Component {
               </div>
             `
             : emptyState(
-              positions.length
-                ? "Inget innehav matchar filtret."
-                : "Lägg till ett köp på översikten för att se det här.",
+              positions.length ? t("holdings.noMatch") : t("holdings.empty"),
             )}
         </aside>
 
         <section class="panel holding-detail">
-          ${position ? this.renderDetail(position) : emptyState(
-            "Välj ett innehav i listan.",
-          )}
+          ${position
+            ? this.renderDetail(position)
+            : emptyState(t("holdings.choose"))}
         </section>
       </section>
     `;
@@ -1499,7 +1701,7 @@ class HoldingsPage extends Component {
             ${[
               position.name,
               quote?.exchange,
-              `noterad i ${chartCurrency}`,
+              t("holdings.listedIn", { currency: chartCurrency }),
             ].filter(Boolean).join(" · ")}
           </p>
         </div>
@@ -1510,21 +1712,21 @@ class HoldingsPage extends Component {
               class="sell-button"
               on-click="${() => openSellDialog(position.symbol)}"
             >
-              Sälj ${position.symbol}
+              ${t("sell.title", { symbol: position.symbol })}
             </button>
           `
           : position.isClosed
           ? html`
-            <span class="pill closed">Avslutad position</span>
+            <span class="pill closed">${t("holdings.closedPosition")}</span>
           `
           : html`
-            <span class="pill closed">Bevakad</span>
+            <span class="pill closed">${t("holdings.watched")}</span>
           `}
       </div>
 
       <div class="detail-stats">
         <div class="fact">
-          <small>Kurs</small>
+          <small>${t("label.price")}</small>
           <strong>${money(position.price)}</strong>
           <span class="${toneClass(
             quote?.changePercent ?? 0,
@@ -1532,33 +1734,35 @@ class HoldingsPage extends Component {
             ? `${formatCurrency(quote.price, chartCurrency)} · ${
               formatPercent(quote?.changePercent ?? 0)
             }`
-            : `${formatPercent(quote?.changePercent ?? 0)} idag`}</span>
+            : todayChange(quote?.changePercent ?? 0)}</span>
         </div>
         <div class="fact">
-          <small>Innehav</small>
-          <strong>${formatShares(position.shares)} st</strong>
+          <small>${t("label.holding")}</small>
+          <strong>${sharesText(position.shares)}</strong>
           <span>${money(position.marketValue)}</span>
         </div>
         <div class="fact">
-          <small>Snittkurs</small>
+          <small>${t("label.averageCost")}</small>
           <strong>${position.isHolding
             ? money(position.averageCost)
             : "–"}</strong>
           <span>${position.isHolding && showNative && nativeAverage
-            ? `${formatCurrency(nativeAverage, chartCurrency)} · inkl. avgifter`
-            : "inkl. avgifter"}</span>
+            ? `${formatCurrency(nativeAverage, chartCurrency)} · ${
+              t("common.inclFees")
+            }`
+            : t("common.inclFees")}</span>
         </div>
         <div class="fact">
-          <small>Orealiserat</small>
+          <small>${t("label.unrealized")}</small>
           <strong class="${toneClass(position.gain)}">${moneySigned(
             position.gain,
           )}</strong>
           <span class="${toneClass(position.gain)}">${position.isHolding
             ? formatPercent(position.gainPercent)
-            : "ingen öppen position"}</span>
+            : t("holdings.noOpenPosition")}</span>
         </div>
         <div class="fact">
-          <small>Realiserat</small>
+          <small>${t("label.realized")}</small>
           <strong class="${toneClass(position.realized)}">${moneySigned(
             position.realized,
           )}</strong>
@@ -1567,38 +1771,40 @@ class HoldingsPage extends Component {
             : "muted"}">${position
               .sellCount
             ? `${formatPercent(position.realizedPercent)} · ${
-              countLabel(position.sellCount, "försäljning", "försäljningar")
+              t("count.sales", { count: position.sellCount })
             }`
-            : "inga försäljningar"}</span>
+            : t("common.noSales")}</span>
         </div>
       </div>
 
       <div class="chart-toolbar">
-        <div class="chip-row" role="group" aria-label="Tidsintervall">
-          ${CHART_RANGES.map((item) =>
+        <div class="chip-row" role="group" aria-label="${t("holdings.range")}">
+          ${CHART_RANGES.map((range) =>
             keyed(
-              item.value,
+              range,
               html`
                 <button
                   type="button"
-                  class="${`chip ${this.range === item.value ? "active" : ""}`}"
-                  on-click="${() => this.setRange(item.value)}"
+                  class="${`chip ${this.range === range ? "active" : ""}`}"
+                  on-click="${() => this.setRange(range)}"
                 >
-                  ${item.label}
+                  ${t(`range.${range}`)}
                 </button>
               `,
             )
           )}
         </div>
         <div class="chart-legend">
-          <span><i class="legend-buy"></i> Köp</span>
-          <span><i class="legend-sell"></i> Sälj</span>
+          <span><i class="legend-buy"></i> ${t("trade.buy")}</span>
+          <span><i class="legend-sell"></i> ${t("trade.sell")}</span>
           ${position.isHolding
             ? html`
-              <span><i class="legend-avg"></i> Snittkurs</span>
+              <span><i class="legend-avg"></i> ${t("label.averageCost")}</span>
             `
             : ""}
-          <span><i class="legend-line"></i> Stängningskurs (${chartCurrency})</span>
+          <span><i class="legend-line"></i> ${t("chart.legendClose", {
+            currency: chartCurrency,
+          })}</span>
         </div>
       </div>
 
@@ -1611,11 +1817,9 @@ class HoldingsPage extends Component {
           this.handleChartLeave,
         )
         : chart.status === "error"
-        ? emptyState(`Kunde inte hämta kurshistorik: ${chart.error}`)
+        ? emptyState(t("chart.loadFailed", { error: chart.error }))
         : emptyState(
-          chart.status === "loading"
-            ? "Hämtar kurshistorik..."
-            : "Ingen kurshistorik tillgänglig för intervallet.",
+          chart.status === "loading" ? t("chart.loading") : t("chart.noData"),
         )}
 
       ${model
@@ -1624,22 +1828,24 @@ class HoldingsPage extends Component {
             <span class="${model.tone}">${formatPercent(
               model.changePercent,
             )}</span>
-            under perioden · högst ${formatCurrency(
-              model.high,
-              model.currency,
-            )} ·
-            lägst ${formatCurrency(model.low, model.currency)}${model.outside
-              ? ` · ${
-                countLabel(model.outside, "affär", "affärer")
-              } ligger före intervallet, välj ett längre`
-              : ""}${chart.status === "loading" ? " · uppdaterar..." : ""}
+            ${[
+              t("chart.duringPeriod"),
+              t("chart.high", {
+                price: formatCurrency(model.high, model.currency),
+              }),
+              t("chart.low", {
+                price: formatCurrency(model.low, model.currency),
+              }),
+              model.outside ? t("chart.outside", { count: model.outside }) : "",
+              chart.status === "loading" ? t("chart.updating") : "",
+            ].filter(Boolean).join(" · ")}
           </p>
         `
         : ""}
 
       <div class="detail-section-heading">
-        <h3>Affärer i ${position.symbol}</h3>
-        <p>Kursen sedan varje affär – stigande kurs efter köp och fallande efter sälj är bra tajming.</p>
+        <h3>${t("holdings.tradesTitle", { symbol: position.symbol })}</h3>
+        <p>${t("holdings.tradesIntro")}</p>
       </div>
       ${trades.length
         ? html`
@@ -1647,7 +1853,7 @@ class HoldingsPage extends Component {
             ${trades.map((trade) => keyed(trade.id, timingRow(trade, model)))}
           </div>
         `
-        : emptyState("Inga affärer registrerade för det här innehavet.")}
+        : emptyState(t("holdings.noTrades"))}
     `;
   }
 }
@@ -1681,12 +1887,12 @@ function holdingListItem(position, selected, onSelect) {
       <small class="${position.isHolding
         ? toneClass(position.gain)
         : toneClass(quote?.changePercent ?? 0)}">${position.isHolding
-        ? `${formatShares(position.shares)} st · ${
+        ? `${sharesText(position.shares)} · ${
           formatPercent(position.gainPercent)
         }`
         : position.isClosed
-        ? `avslutad · ${moneySigned(position.realized)}`
-        : `${formatPercent(quote?.changePercent ?? 0)} idag`}</small>
+        ? t("holdings.closedResult", { amount: moneySigned(position.realized) })
+        : todayChange(quote?.changePercent ?? 0)}</small>
     </button>
   `;
 }
@@ -1920,11 +2126,28 @@ function priceChart(model, hover, position, onMove, onLeave) {
       y: model.y(model.closes[hover]),
       date: model.points[hover].date,
       close: model.closes[hover],
-      trades: model.markers.filter((marker) => marker.index === hover),
+      trades: model.markers
+        .filter((marker) => marker.index === hover)
+        .map((marker) => ({
+          ...marker,
+          text: tradeAtText(
+            marker.type,
+            marker.record.quantity,
+            formatCurrency(marker.native.price ?? marker.close, model.currency),
+          ),
+        })),
     }
     : null;
   const tooltipLeft = hovered && hovered.x > CHART.width / 2;
-  const tooltipWidth = 176;
+  // Wide enough for the longest trade line: roughly 0.6em per character at
+  // the chart's font size, which is larger on phones (see styles.css).
+  const fontSize = matchMedia("(max-width: 640px)").matches ? 15 : 11;
+  const tooltipWidth = Math.max(
+    176,
+    ...(hovered?.trades ?? []).map((trade) =>
+      Math.ceil(trade.text.length * fontSize * 0.6) + 20
+    ),
+  );
   const tooltipHeight = 44 + (hovered?.trades.length ?? 0) * 16;
   const tooltipX = hovered
     ? tooltipLeft ? hovered.x - tooltipWidth - 12 : hovered.x + 12
@@ -1944,7 +2167,7 @@ function priceChart(model, hover, position, onMove, onLeave) {
       class="${`price-chart ${model.tone}`}"
       viewBox="${`0 0 ${CHART.width} ${CHART.height}`}"
       role="img"
-      aria-label="${`${position.symbol} kursdiagram med köp och försäljningar`}"
+      aria-label="${t("chart.label", { symbol: position.symbol })}"
       on-pointermove="${onMove}"
       on-pointerdown="${onMove}"
       on-pointerleave="${onLeave}"
@@ -2021,7 +2244,9 @@ function priceChart(model, hover, position, onMove, onLeave) {
               y="${(model.y(model.nativeAverage) - 6).toFixed(1)}"
               text-anchor="end"
             >
-              snitt ${formatCurrency(model.nativeAverage, model.currency)}
+              ${t("common.avg", {
+                price: formatCurrency(model.nativeAverage, model.currency),
+              })}
             </text>
           </svg>
         `
@@ -2067,12 +2292,7 @@ function priceChart(model, hover, position, onMove, onLeave) {
                         x="10"
                         y="${51 + index * 16}"
                       >
-                        ${trade.type === "buy" ? "Köp" : "Sälj"} ${formatShares(
-                          trade.record.quantity,
-                        )} st à ${formatCurrency(
-                          trade.native.price ?? trade.close,
-                          model.currency,
-                        )}
+                        ${trade.text}
                       </text>
                     </svg>
                   `,
@@ -2089,11 +2309,15 @@ function priceChart(model, hover, position, onMove, onLeave) {
 function chartMarker(marker, model) {
   const cx = model.x(marker.index) + (marker.dx ?? 0);
   const cy = model.y(marker.value);
-  const label = `${marker.type === "buy" ? "Köp" : "Sälj"} ${
-    formatShares(marker.record.quantity)
-  } st à ${formatCurrency(marker.value, model.currency)}${
-    marker.native.exact ? "" : " (omräknat)"
-  } · ${formatDate(marker.date)}`;
+  const label = `${
+    tradeAtText(
+      marker.type,
+      marker.record.quantity,
+      formatCurrency(marker.value, model.currency),
+    )
+  }${marker.native.exact ? "" : ` ${t("chart.converted")}`} · ${
+    formatDate(marker.date)
+  }`;
 
   return marker.type === "buy"
     ? html`
@@ -2124,43 +2348,45 @@ function timingRow(trade, model) {
     ? "neutral"
     : toneClass(isBuy ? since : -since);
   const verdict = since === null
-    ? "väntar på kurs"
+    ? t("common.waitingForPrice")
     : unchanged
-    ? "oförändrad kurs sedan affären"
+    ? t("timing.unchanged")
     : isBuy
-    ? since >= 0
-      ? "kursen har stigit sedan köpet"
-      : "kursen har fallit sedan köpet"
+    ? since >= 0 ? t("timing.risenSinceBuy") : t("timing.fallenSinceBuy")
     : since <= 0
-    ? "bra tajming – kursen har fallit sedan"
-    : "kursen har stigit sedan försäljningen";
+    ? t("timing.goodSell")
+    : t("timing.risenSinceSell");
   const inChart = model
     ? model.markers.some((marker) => marker.id === trade.id)
     : false;
 
   return html`
     <article class="${`timing-row ${trade.type}`}">
-      <span class="${`badge ${trade.type}`}">${isBuy ? "Köp" : "Sälj"}</span>
+      <span class="${`badge ${trade.type}`}">${tradeLabel(trade.type)}</span>
       <div>
         <strong>${formatDate(trade.date)}</strong>
-        <span>${formatShares(record.quantity)} st à ${formatCurrency(
-          Number(record.price) || 0,
-          currency,
-        )}${model && !inChart ? " · utanför diagrammet" : ""}</span>
+        <span>${t("trade.sharesAt", {
+          shares: sharesText(record.quantity),
+          price: formatCurrency(Number(record.price) || 0, currency),
+        })}${model && !inChart ? ` · ${t("timing.outsideChart")}` : ""}</span>
       </div>
       <div>
-        <span class="cell-label">${isBuy ? "Kostnad" : "Erhållet"}</span>
+        <span class="cell-label">${isBuy
+          ? t("label.cost")
+          : t("label.proceeds")}</span>
         <strong>${money(tradeAmount(record, trade.type))}</strong>
       </div>
       <div>
-        <span class="cell-label">Kurs sedan affären</span>
+        <span class="cell-label">${t("timing.priceSince")}</span>
         <strong class="${timingTone}">${since === null
           ? "–"
           : formatPercent(since)}</strong>
         <small class="muted">${verdict}</small>
       </div>
       <div>
-        <span class="cell-label">${isBuy ? "Anteckning" : "Realiserat"}</span>
+        <span class="cell-label">${isBuy
+          ? t("label.note")
+          : t("label.realized")}</span>
         ${isBuy
           ? html`
             <strong class="muted">${record.note || "–"}</strong>
@@ -2220,7 +2446,7 @@ function axisDate(value, range) {
   if (Number.isNaN(date.getTime())) return value;
   const short = range === "1mo" || range === "3mo" || range === "6mo";
   return new Intl.DateTimeFormat(
-    "sv-SE",
+    getFormatLocale(),
     short
       ? { day: "numeric", month: "short" }
       : { month: "short", year: "2-digit" },
@@ -2228,7 +2454,7 @@ function axisDate(value, range) {
 }
 
 function axisPrice(value) {
-  return new Intl.NumberFormat("sv-SE", {
+  return new Intl.NumberFormat(getFormatLocale(), {
     maximumFractionDigits: Math.abs(value) >= 100 ? 0 : 2,
   }).format(value);
 }
@@ -2307,12 +2533,8 @@ class TransactionsPage extends Component {
         <section class="panel">
           <div class="panel-heading">
             <div>
-              <h1>Transaktioner</h1>
-              <p>
-                Köp och försäljningar sparas lokalt i IndexedDB, i affärens
-                valuta med växelkursen på affärsdagen. Resultatet räknas i SEK
-                mot snittkursen vid tillfället (genomsnittsmetoden).
-              </p>
+              <h1>${t("transactions.title")}</h1>
+              <p>${t("transactions.intro", { base: BASE_CURRENCY })}</p>
             </div>
             ${hasHoldings
               ? html`
@@ -2321,7 +2543,7 @@ class TransactionsPage extends Component {
                   class="sell-button"
                   on-click="${() => openSellDialog(symbolFilter)}"
                 >
-                  Sälj innehav
+                  ${t("action.sellHolding")}
                 </button>
               `
               : ""}
@@ -2331,21 +2553,17 @@ class TransactionsPage extends Component {
             ? html`
               <div class="tx-summary">
                 <div class="fact">
-                  <small>Investerat</small>
+                  <small>${t("transactions.invested")}</small>
                   <strong>${money(invested)}</strong>
-                  <span>${countLabel(buys.length, "köp", "köp")}</span>
+                  <span>${t("count.buys", { count: buys.length })}</span>
                 </div>
                 <div class="fact">
-                  <small>Sålt för</small>
+                  <small>${t("transactions.soldFor")}</small>
                   <strong>${money(proceeds)}</strong>
-                  <span>${countLabel(
-                    sells.length,
-                    "försäljning",
-                    "försäljningar",
-                  )}</span>
+                  <span>${t("count.sales", { count: sells.length })}</span>
                 </div>
                 <div class="fact">
-                  <small>Realiserat</small>
+                  <small>${t("label.realized")}</small>
                   <strong class="${toneClass(realized)}">${moneySigned(
                     realized,
                   )}</strong>
@@ -2354,24 +2572,40 @@ class TransactionsPage extends Component {
                       ? formatPercent(
                         realizedCost > 0 ? realized / realizedCost * 100 : 0,
                       )
-                      : "inga försäljningar"}
+                      : t("common.noSales")}
                   </span>
                 </div>
               </div>
 
               <div class="filter-bar">
-                <div class="chip-row" role="group" aria-label="Typ">
-                  ${filterChip(this, "all", `Alla · ${inScope.length}`)}
-                  ${filterChip(this, "buy", `Köp · ${buys.length}`)}
-                  ${filterChip(this, "sell", `Sälj · ${sells.length}`)}
+                <div
+                  class="chip-row"
+                  role="group"
+                  aria-label="${t("transactions.type")}"
+                >
+                  ${filterChip(
+                    this,
+                    "all",
+                    `${t("filter.all")} · ${inScope.length}`,
+                  )}
+                  ${filterChip(
+                    this,
+                    "buy",
+                    `${t("trade.buy")} · ${buys.length}`,
+                  )}
+                  ${filterChip(
+                    this,
+                    "sell",
+                    `${t("trade.sell")} · ${sells.length}`,
+                  )}
                 </div>
                 <select
                   class="symbol-filter"
-                  aria-label="Filtrera på symbol"
+                  aria-label="${t("transactions.symbolFilter")}"
                   on-change="${(event) =>
                     this.symbolFilter = event.target.value}"
                 >
-                  <option value="">Alla symboler</option>
+                  <option value="">${t("transactions.allSymbols")}</option>
                   ${symbols.map((symbol) =>
                     keyed(
                       symbol,
@@ -2395,8 +2629,8 @@ class TransactionsPage extends Component {
             `
             : emptyState(
               entries.length
-                ? "Inga transaktioner matchar filtret."
-                : "Inga transaktioner har sparats. Lägg till ett köp på översikten.",
+                ? t("transactions.noMatch")
+                : t("transactions.empty"),
             )}
         </section>
       </section>
@@ -2421,7 +2655,7 @@ class ResearchPage extends Component {
     try {
       state.searchResults = await searchSymbols(query);
       if (state.searchResults.length === 0) {
-        this.message = "Inga matchande tickers hittades.";
+        this.message = t("research.noResults");
       }
     } catch (error) {
       this.message = error.message;
@@ -2432,7 +2666,7 @@ class ResearchPage extends Component {
 
   track = async (symbol) => {
     await trackSymbol(symbol);
-    this.message = `${symbol} bevakas nu lokalt.`;
+    this.message = t("research.watching", { symbol });
   };
 
   render() {
@@ -2442,22 +2676,21 @@ class ResearchPage extends Component {
         <section class="panel search-panel">
           <div class="panel-heading">
             <div>
-              <h1>Sök</h1>
-              <p>
-                Sök Yahoo Finance-symboler och lägg till dem i din lokala
-                bevakningslista.
-              </p>
+              <h1>${t("research.title")}</h1>
+              <p>${t("research.intro")}</p>
             </div>
           </div>
           <form class="search-form" on-submit="${this.search}">
             <input
               autocomplete="off"
-              placeholder="Sök bolag eller aktiesymbol"
+              placeholder="${t("research.placeholder")}"
               .value="${this.query}"
               on-input="${(event) => this.query = event.target.value}"
             />
             <button class="primary-button" disabled="${state.searchLoading}">
-              ${state.searchLoading ? "Söker" : "Sök"}
+              ${state.searchLoading
+                ? t("research.searching")
+                : t("research.search")}
             </button>
           </form>
           ${this.message
@@ -2477,8 +2710,9 @@ class ResearchPage extends Component {
                       <small>${[result.exchange, result.type, result.sector]
                         .filter(Boolean).join(" / ")}</small>
                     </div>
-                    <button on-click="${() =>
-                      this.track(result.symbol)}">Bevaka</button>
+                    <button on-click="${() => this.track(result.symbol)}">${t(
+                      "research.watch",
+                    )}</button>
                   </article>
                 `,
               )
@@ -2489,8 +2723,8 @@ class ResearchPage extends Component {
         <section class="panel watch-panel">
           <div class="panel-heading">
             <div>
-              <h2>Bevakade symboler</h2>
-              <p>Bevakningslista och innehav med lokalt cachade kursbilder.</p>
+              <h2>${t("research.watchedTitle")}</h2>
+              <p>${t("research.watchedIntro")}</p>
             </div>
           </div>
           ${positions.length
@@ -2501,7 +2735,7 @@ class ResearchPage extends Component {
                 )}
               </div>
             `
-            : emptyState("Sök och bevaka en symbol, eller spara ett köp.")}
+            : emptyState(t("research.watchedEmpty"))}
         </section>
       </section>
     `;
@@ -2542,15 +2776,25 @@ class SettingsPage extends Component {
 
     this.busy = true;
     try {
-      const data = JSON.parse(await file.text());
+      let data;
+      try {
+        data = JSON.parse(await file.text());
+      } catch {
+        throw new Error(t("import.invalid"));
+      }
       const clean = validateImport(data);
       await replaceAllData(clean);
       await hydrateState();
-      this.message = `Importerade ${
-        countLabel(clean.lots.length, "köp", "köp")
-      } och ${countLabel(clean.sales.length, "försäljning", "försäljningar")}${
-        clean.skipped ? ` · ${clean.skipped} ogiltiga poster hoppades över` : ""
-      }.`;
+      const counts = {
+        buys: t("count.buys", { count: clean.lots.length }),
+        sales: t("count.sales", { count: clean.sales.length }),
+      };
+      this.message = clean.skipped
+        ? t("settings.importedSkipped", {
+          ...counts,
+          skipped: t("count.skipped", { count: clean.skipped }),
+        })
+        : t("settings.imported", counts);
     } catch (error) {
       this.message = error.message;
     } finally {
@@ -2560,25 +2804,21 @@ class SettingsPage extends Component {
   };
 
   clearData = async () => {
-    if (
-      !confirm("Ta bort all lokal Stockroom-data från den här webbläsaren?")
-    ) {
-      return;
-    }
+    if (!confirm(t("settings.confirmClear"))) return;
     await clearAllLocalData();
     await hydrateState();
-    this.message = "Lokal data rensad.";
+    this.message = t("settings.cleared");
   };
 
   persistStorage = async () => {
     if (!navigator.storage?.persist) {
-      this.message = "Beständig webbläsarlagring är inte tillgänglig här.";
+      this.message = t("settings.persistUnavailable");
       return;
     }
     const granted = await navigator.storage.persist();
     this.message = granted
-      ? "Webbläsaren beviljade beständig lagring."
-      : "Webbläsaren beviljade inte beständig lagring.";
+      ? t("settings.persistGranted")
+      : t("settings.persistDenied");
   };
 
   render() {
@@ -2592,26 +2832,25 @@ class SettingsPage extends Component {
         <section class="panel">
           <div class="panel-heading">
             <div>
-              <h1>Lokal data</h1>
-              <p>
-                Köp, försäljningar och bevakningar stannar i den här
-                webbläsarens IndexedDB.
-              </p>
+              <h1>${t("settings.localTitle")}</h1>
+              <p>${t("settings.localIntro")}</p>
             </div>
           </div>
           <div class="settings-actions">
             <button class="primary-button" on-click="${this
               .exportData}">
-              Exportera JSON
+              ${t("settings.export")}
             </button>
             <label class="file-button">
-              Importera JSON
+              ${t("settings.import")}
               <input type="file" accept="application/json" on-change="${this
                 .importData}" />
             </label>
-            <button on-click="${this.persistStorage}">Beständig lagring</button>
+            <button on-click="${this.persistStorage}">${t(
+              "settings.persist",
+            )}</button>
             <button class="danger-button" on-click="${this.clearData}">
-              Rensa lokal data
+              ${t("settings.clear")}
             </button>
           </div>
           ${this.message
@@ -2624,35 +2863,42 @@ class SettingsPage extends Component {
         <section class="panel">
           <div class="panel-heading">
             <div>
-              <h2>Lagring</h2>
-              <p>Antalen nedan är lokala poster, inte serverposter.</p>
+              <h2>${t("settings.storageTitle")}</h2>
+              <p>${t("settings.storageIntro")}</p>
             </div>
           </div>
           <div class="storage-stats">
-            <span><strong>${state.lots.length}</strong> köp</span>
-            <span><strong>${state.sales.length}</strong> försäljningar</span>
-            <span><strong>${state.watchlist
-              .length}</strong> bevakade symboler</span>
-            <span><strong>${Object.keys(state.quotes)
-              .length}</strong> kursbilder</span>
-            <span><strong>${History.all()
-              .length}</strong> kurshistoriker synkade från servern</span>
+            ${[
+              ["stats.buys", state.lots.length],
+              ["stats.sales", state.sales.length],
+              ["stats.watched", state.watchlist.length],
+              ["stats.quotes", Object.keys(state.quotes).length],
+              ["stats.histories", History.all().length],
+            ].map(([key, count]) =>
+              keyed(
+                key,
+                html`
+                  <span><strong>${count}</strong> ${t(key, { count })}</span>
+                `,
+              )
+            )}
           </div>
         </section>
 
         <section class="panel currency-panel">
           <div class="panel-heading">
             <div>
-              <h2>Valuta</h2>
-              <p>
-                Affärer bokförs i SEK med växelkursen på affärsdagen.
-                Visningsvalutan räknar om hela portföljen med aktuell kurs.
-              </p>
+              <h2>${t("settings.currencyTitle")}</h2>
+              <p>${t("settings.currencyIntro", { base: BASE_CURRENCY })}</p>
             </div>
           </div>
           <div class="settings-actions">
-            <span class="muted">Visningsvaluta</span>
-            <div class="segmented" role="group" aria-label="Visningsvaluta">
+            <span class="muted">${t("currency.display")}</span>
+            <div
+              class="segmented"
+              role="group"
+              aria-label="${t("currency.display")}"
+            >
               ${VIEW_CURRENCIES.map((currency) =>
                 keyed(
                   currency,
@@ -2689,9 +2935,7 @@ class SettingsPage extends Component {
               </div>
             `
             : html`
-              <p class="inline-message">
-                Växelkurser hämtas från Yahoo Finance när de behövs.
-              </p>
+              <p class="inline-message">${t("settings.ratesHint")}</p>
             `}
         </section>
       </section>
@@ -2700,6 +2944,7 @@ class SettingsPage extends Component {
 }
 
 AppRoot.register();
+LanguagePicker.register();
 DashboardPage.register();
 AddLotForm.register();
 SellDialog.register();
@@ -2909,7 +3154,7 @@ async function deleteLot(id) {
 
 async function addSale(input) {
   const symbol = normalizeSymbol(input.symbol);
-  if (!symbol) throw new Error("Aktiesymbol saknas");
+  if (!symbol) throw new Error(t("errors.symbolMissing"));
   const currency = normalizeCurrency(input.currency) || BASE_CURRENCY;
 
   const now = new Date().toISOString();
@@ -2949,9 +3194,11 @@ async function deleteSale(id) {
 
 async function confirmDeleteLot(lot) {
   const ok = confirm(
-    `Ta bort köpet av ${formatShares(lot.quantity)} ${lot.symbol} (${
-      formatDate(lot.purchasedAt)
-    })?`,
+    t("confirm.deleteBuy", {
+      shares: formatShares(lot.quantity),
+      symbol: lot.symbol,
+      date: formatDate(lot.purchasedAt),
+    }),
   );
   if (!ok) return;
   await deleteLot(lot.id);
@@ -2959,9 +3206,11 @@ async function confirmDeleteLot(lot) {
 
 async function confirmDeleteSale(sale) {
   const ok = confirm(
-    `Ta bort försäljningen av ${formatShares(sale.quantity)} ${sale.symbol} (${
-      formatDate(sale.soldAt)
-    })? Aktierna räknas då som ägda igen.`,
+    t("confirm.deleteSale", {
+      shares: formatShares(sale.quantity),
+      symbol: sale.symbol,
+      date: formatDate(sale.soldAt),
+    }),
   );
   if (!ok) return;
   await deleteSale(sale.id);
@@ -3030,17 +3279,18 @@ async function closeOn(symbol, date) {
 }
 
 function describeLookup(symbol, lookup) {
-  const when = lookup.priceDate
-    ? `Stängningskurs ${formatDate(lookup.priceDate)}`
-    : "Senaste kurs";
+  const price = formatCurrency(lookup.price, lookup.currency);
+  const quote = lookup.priceDate
+    ? t("lookup.close", { date: formatDate(lookup.priceDate), symbol, price })
+    : t("lookup.latest", { symbol, price });
   const fx = lookup.currency === BASE_CURRENCY
     ? ""
-    : ` · ${formatNumber(lookup.fxRate, 4)} SEK/${lookup.currency}${
-      lookup.fxDate ? "" : " (aktuell kurs)"
+    : ` · ${
+      formatNumber(lookup.fxRate, 4)
+    } ${BASE_CURRENCY}/${lookup.currency}${
+      lookup.fxDate ? "" : ` ${t("lookup.currentRate")}`
     }`;
-  return `${when} för ${symbol}: ${
-    formatCurrency(lookup.price, lookup.currency)
-  }${fx}.`;
+  return `${quote}${fx}.`;
 }
 
 function priceInputValue(value) {
@@ -3059,7 +3309,7 @@ function rateInputValue(value) {
 
 async function trackSymbol(symbol, options = {}) {
   const cleanSymbol = normalizeSymbol(symbol);
-  if (!cleanSymbol) throw new Error("Aktiesymbol saknas");
+  if (!cleanSymbol) throw new Error(t("errors.symbolMissing"));
 
   if (!state.watchlist.some((item) => item.symbol === cleanSymbol)) {
     const record = {
@@ -3073,7 +3323,7 @@ async function trackSymbol(symbol, options = {}) {
 
   await refreshOneSymbol(cleanSymbol);
   if (!options.quiet) {
-    state.notice = `${cleanSymbol} bevakas på den här enheten.`;
+    state.notice = t("watch.added", { symbol: cleanSymbol });
   }
 }
 
@@ -3090,7 +3340,10 @@ async function refreshOneSymbol(symbol) {
   const quote = payload.quotes?.[0];
   if (!quote) {
     throw new Error(
-      payload.errors?.[0]?.message ?? `Ingen kurs hittades för ${symbol}`,
+      translateServerError(
+        payload.errors?.[0],
+        t("errors.noQuote", { symbol }),
+      ),
     );
   }
 
@@ -3127,7 +3380,7 @@ async function refreshTrackedSymbols(options = {}) {
 
     if (payload.errors?.length && !options.quiet) {
       state.error = payload.errors
-        .map((item) => `${item.symbol}: ${item.message}`)
+        .map((item) => `${item.symbol}: ${translateServerError(item)}`)
         .join(" / ");
     }
   } catch (error) {
@@ -3196,9 +3449,10 @@ async function ensureFxRates(currencies, options = {}) {
   );
   if (options.required && stillMissing.length) {
     throw new Error(
-      `Kunde inte hämta växelkurs för ${
-        stillMissing.join(", ")
-      } till ${BASE_CURRENCY}.`,
+      t("errors.fxRate", {
+        currencies: stillMissing.join(", "),
+        base: BASE_CURRENCY,
+      }),
     );
   }
 }
@@ -3307,8 +3561,8 @@ function buildTransactionEntries(bySymbol) {
 
 function lastRefreshText() {
   const value = state.settings.lastRefresh;
-  if (!value) return "ej uppdaterad";
-  return new Intl.DateTimeFormat("sv-SE", {
+  if (!value) return t("refresh.never");
+  return new Intl.DateTimeFormat(getFormatLocale(), {
     hour: "2-digit",
     minute: "2-digit",
     month: "short",
@@ -3320,8 +3574,30 @@ function today() {
   return new Date().toISOString().slice(0, 10);
 }
 
-function countLabel(count, singular, plural) {
-  return `${count} ${count === 1 ? singular : plural}`;
+/** "12 st" / "12 shares": a share count with its unit. */
+function sharesText(quantity) {
+  return t("units.shares", { count: quantity });
+}
+
+function todayChange(percent) {
+  return t("common.today", { percent: formatPercent(percent) });
+}
+
+function tradeLabel(type) {
+  return type === "buy" ? t("trade.buy") : t("trade.sell");
+}
+
+/** "Köp 12 st à 100 kr" for chart markers and tooltips. */
+function tradeAtText(type, quantity, price) {
+  return t(type === "buy" ? "chart.buyAt" : "chart.sellAt", {
+    shares: sharesText(quantity),
+    price,
+  });
+}
+
+function percentLabel(fraction) {
+  return new Intl.NumberFormat(getFormatLocale(), { style: "percent" })
+    .format(fraction);
 }
 
 function syncSelect(root, selector, value) {
@@ -3336,7 +3612,7 @@ function currencySelect(current, onChange) {
   return html`
     <select
       class="currency-select"
-      aria-label="Valuta"
+      aria-label="${t("currency.label")}"
       .value="${current}"
       on-change="${onChange}"
     >
@@ -3374,7 +3650,7 @@ function positionRow(position) {
         class="sparkline"
         viewBox="0 0 180 54"
         role="img"
-        aria-label="${position.symbol} pristrend"
+        aria-label="${t("position.trend", { symbol: position.symbol })}"
       >
         <path class="sparkline-grid" d="M0 27 L180 27"></path>
         <path class="${`sparkline-path ${
@@ -3382,30 +3658,33 @@ function positionRow(position) {
         }`}" d="${path}"></path>
       </svg>
       <div>
-        <span class="cell-label">Antal</span>
+        <span class="cell-label">${t("label.quantity")}</span>
         <strong>${formatShares(position.shares)}</strong>
-        <small class="muted">snitt ${money(position.averageCost)}</small>
+        <small class="muted">${t("common.avg", {
+          price: money(position.averageCost),
+        })}</small>
       </div>
       <div>
-        <span class="cell-label">Pris</span>
+        <span class="cell-label">${t("position.price")}</span>
         <strong>${money(position.price)}</strong>
         <small class="${toneClass(quote?.changePercent ?? 0)}">${showNative
           ? `${formatCurrency(quote.price, quoteCurrency)} · `
-          : ""}${formatPercent(quote?.changePercent ?? 0)} idag</small>
+          : ""}${todayChange(quote?.changePercent ?? 0)}</small>
       </div>
       <div>
-        <span class="cell-label">Värde</span>
+        <span class="cell-label">${t("position.value")}</span>
         <strong>${money(position.marketValue)}</strong>
         ${position.sellCount
           ? html`
-            <small class="${toneClass(position.realized)}">${moneySigned(
-              position.realized,
-            )} realiserat</small>
+            <small class="${toneClass(position.realized)}">${t(
+              "position.realizedAmount",
+              { amount: moneySigned(position.realized) },
+            )}</small>
           `
           : ""}
       </div>
       <div>
-        <span class="cell-label">Resultat</span>
+        <span class="cell-label">${t("position.result")}</span>
         <strong class="${toneClass(position.gain)}">
           ${moneySigned(position.gain)}
         </strong>
@@ -3418,7 +3697,7 @@ function positionRow(position) {
         class="sell-button compact"
         on-click="${() => openSellDialog(position.symbol)}"
       >
-        Sälj
+        ${t("action.sell")}
       </button>
     </article>
   `;
@@ -3450,56 +3729,62 @@ function transactionRow(entry) {
   return html`
     <article class="${`transaction-row ${entry.type}`}">
       <div class="tx-identity">
-        <span class="${`badge ${entry.type}`}">${isBuy ? "Köp" : "Sälj"}</span>
+        <span class="${`badge ${entry.type}`}">${tradeLabel(entry.type)}</span>
         <div>
           <strong>${record.symbol}</strong>
           <span>${record.note || position?.name || record.symbol}</span>
         </div>
       </div>
       <div>
-        <span class="cell-label">Datum</span>
+        <span class="cell-label">${t("label.date")}</span>
         <strong>${formatDate(entry.date)}</strong>
       </div>
       <div>
-        <span class="cell-label">Antal</span>
+        <span class="cell-label">${t("label.quantity")}</span>
         <strong>${formatShares(quantity)}</strong>
       </div>
       <div>
-        <span class="cell-label">Kurs</span>
+        <span class="cell-label">${t("label.price")}</span>
         <strong>${formatCurrency(price, currency)}</strong>
         <small class="muted">${[
           foreign
             ? `× ${formatNumber(fxRate, 4)} = ${money(price * fxRate)}`
             : "",
-          fees > 0 ? `avgift ${formatCurrency(fees, currency)}` : "",
+          fees > 0
+            ? t("transactions.fee", { amount: formatCurrency(fees, currency) })
+            : "",
         ].filter(Boolean).join(" · ")}</small>
       </div>
       <div>
-        <span class="cell-label">${isBuy ? "Kostnad" : "Erhållet"}</span>
+        <span class="cell-label">${isBuy
+          ? t("label.cost")
+          : t("label.proceeds")}</span>
         <strong>${money(amount)}</strong>
       </div>
       <div>
         <span class="cell-label">${isBuy
-          ? "Kurs sedan köp"
-          : "Realiserat"}</span>
+          ? t("transactions.priceSinceBuy")
+          : t("label.realized")}</span>
         ${isBuy
           ? html`
             <strong class="${toneClass(sinceBuy ?? 0)}">${sinceBuy === null
               ? "–"
               : formatPercent(sinceBuy)}</strong>
             <small class="muted">${sinceBuy === null
-              ? "väntar på kurs"
-              : `nu ${
-                quote && quoteCurrency === currency
+              ? t("common.waitingForPrice")
+              : t("transactions.now", {
+                price: quote && quoteCurrency === currency
                   ? formatCurrency(quote.price, currency)
-                  : money(position?.price ?? 0)
-              }`}</small>
+                  : money(position?.price ?? 0),
+              })}</small>
           `
           : html`
             <strong class="${toneClass(gain)}">${moneySigned(gain)}</strong>
             <small class="${toneClass(gain)}">${formatPercent(
               result?.gainPercent ?? 0,
-            )} · snitt ${money(result?.averageCost ?? 0)}</small>
+            )} · ${t("common.avg", {
+              price: money(result?.averageCost ?? 0),
+            })}</small>
           `}
       </div>
       <button
@@ -3508,7 +3793,7 @@ function transactionRow(entry) {
         on-click="${() =>
           isBuy ? confirmDeleteLot(record) : confirmDeleteSale(record)}"
       >
-        Ta bort
+        ${t("common.delete")}
       </button>
     </article>
   `;
@@ -3542,30 +3827,31 @@ function watchCard(position) {
         ${position.isHolding
           ? html`
             <div class="card-actions">
-              <span class="pill">${formatShares(position.shares)} st</span>
+              <span class="pill">${sharesText(position.shares)}</span>
               <button
                 type="button"
                 class="sell-button compact"
                 on-click="${() => openSellDialog(position.symbol)}"
               >
-                Sälj
+                ${t("action.sell")}
               </button>
             </div>
           `
           : position.isClosed
           ? html`
-            <span class="pill closed">Avslutad</span>
+            <span class="pill closed">${t("watch.closed")}</span>
           `
           : html`
-            <button on-click="${() =>
-              untrackSymbol(position.symbol)}">Sluta bevaka</button>
+            <button on-click="${() => untrackSymbol(position.symbol)}">${t(
+              "watch.stop",
+            )}</button>
           `}
       </div>
       <svg
         class="watch-chart"
         viewBox="0 0 240 72"
         role="img"
-        aria-label="${position.symbol} diagram"
+        aria-label="${t("watch.chart", { symbol: position.symbol })}"
       >
         <path class="sparkline-grid" d="M0 36 L240 36"></path>
         <path class="${`sparkline-path ${
@@ -3574,7 +3860,7 @@ function watchCard(position) {
       </svg>
       <div class="watch-stats">
         <span>
-          <small>Senast</small>
+          <small>${t("watch.last")}</small>
           <strong>${money(position.price)}</strong>
           ${showNative
             ? html`
@@ -3586,13 +3872,15 @@ function watchCard(position) {
             : ""}
         </span>
         <span>
-          <small>Rörelse</small>
+          <small>${t("watch.change")}</small>
           <strong class="${toneClass(quote?.change ?? 0)}">
             ${formatPercent(quote?.changePercent ?? 0)}
           </strong>
         </span>
         <span>
-          <small>${position.sellCount ? "Realiserat" : "Uppdaterad"}</small>
+          <small>${position.sellCount
+            ? t("label.realized")
+            : t("watch.updated")}</small>
           ${position.sellCount
             ? html`
               <strong class="${toneClass(position.realized)}">${moneySigned(
@@ -3602,7 +3890,7 @@ function watchCard(position) {
             : html`
               <strong>${quote?.marketTime
                 ? shortDate(quote.marketTime)
-                : "Väntar"}</strong>
+                : t("watch.waiting")}</strong>
             `}
         </span>
       </div>
@@ -3649,10 +3937,12 @@ function realizedList(positions) {
             <div class="realized-row">
               <div>
                 <strong>${position.symbol}</strong>
-                <span>${formatShares(position.soldShares)} sålda · ${position
+                <span>${t("realized.sold", {
+                  count: position.soldShares,
+                })} · ${position
                     .isClosed
-                  ? "positionen avslutad"
-                  : `${formatShares(position.shares)} kvar`}</span>
+                  ? t("realized.closed")
+                  : t("realized.remaining", { count: position.shares })}</span>
               </div>
               <div class="realized-value">
                 <strong class="${toneClass(position.realized)}">${moneySigned(
@@ -3689,7 +3979,7 @@ function emptyState(text) {
 }
 
 function shortDate(value) {
-  return new Intl.DateTimeFormat("sv-SE", {
+  return new Intl.DateTimeFormat(getFormatLocale(), {
     month: "short",
     day: "numeric",
     hour: "2-digit",
@@ -3704,16 +3994,16 @@ function shortDate(value) {
  */
 function validateImport(data) {
   if (!data || typeof data !== "object" || Array.isArray(data)) {
-    throw new Error("Importfilen är inte giltig JSON.");
+    throw new Error(t("import.invalid"));
   }
   if (!Array.isArray(data.lots)) {
-    throw new Error("Importfilen saknar köp.");
+    throw new Error(t("import.noBuys"));
   }
   if (data.sales !== undefined && !Array.isArray(data.sales)) {
-    throw new Error("Importfilens försäljningar har fel format.");
+    throw new Error(t("import.badSales"));
   }
   if (!Array.isArray(data.watchlist)) {
-    throw new Error("Importfilen saknar bevakningslista.");
+    throw new Error(t("import.noWatchlist"));
   }
 
   const lots = data.lots.map((lot) => sanitizeTrade(lot, "purchasedAt"));
