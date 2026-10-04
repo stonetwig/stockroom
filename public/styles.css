@@ -123,6 +123,27 @@ svg {
   padding: 18px 0 36px;
 }
 
+.promo-strip {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 4px 8px;
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: 0.8rem;
+  text-align: center;
+}
+
+.promo-strip a {
+  color: var(--blue);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.promo-strip a:hover {
+  text-decoration: underline;
+}
+
 .topbar {
   position: sticky;
   top: 0;

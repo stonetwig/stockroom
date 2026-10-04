@@ -84,6 +84,13 @@ const state = reactive({
 RouterLink.register();
 RouterOutlet.register();
 
+const PROMO_TEXT = (() => {
+  const language = navigator.languages?.[0] ?? navigator.language ?? "";
+  return language.toLowerCase().startsWith("sv")
+    ? { lead: "Vill du ha en bättre budgetapp?", link: "Testa Sambokoll" }
+    : { lead: "Want a better budgeting app?", link: "Try Sambokoll" };
+})();
+
 class AppRoot extends Component {
   static tag = "app-root";
 
@@ -95,6 +102,15 @@ class AppRoot extends Component {
     const current = displayCurrency();
     return html`
       <div class="app-shell">
+        <aside class="promo-strip">
+          <span>${PROMO_TEXT.lead}</span>
+          <a
+            href="https://sambokoll.se"
+            target="_blank"
+            rel="noopener"
+          >${PROMO_TEXT.link} →</a>
+        </aside>
+
         <header class="topbar">
           <router-link class="brand-link" to="/" title="Till översikten">
             <span class="brand-block">
