@@ -821,8 +821,8 @@ function withSecurityHeaders(response, url) {
       "Content-Security-Policy",
       [
         "default-src 'self'",
-        "script-src 'self' https://plausible.glate.ch",
-        "connect-src 'self' https://plausible.glate.ch",
+        "script-src 'self' https://rendly.stream",
+        "connect-src 'self' https://rendly.stream",
         "style-src 'self' 'unsafe-inline'",
         "img-src 'self' data:",
         "font-src 'self'",
