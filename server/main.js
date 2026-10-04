@@ -75,7 +75,9 @@ Deno.serve({ port: PORT }, async (request, info) => {
     }
   } catch (error) {
     console.error(error);
-    response = json({ error: "Oväntat serverfel" }, { status: 500 });
+    response = json({ error: "Oväntat serverfel", code: "serverError" }, {
+      status: 500,
+    });
   }
 
   return withSecurityHeaders(response, url);
@@ -85,7 +87,7 @@ Deno.serve({ port: PORT }, async (request, info) => {
 
 async function handleApi(request, url, info) {
   if (request.method !== "GET" && request.method !== "HEAD") {
-    return json({ error: "Metoden stöds inte" }, {
+    return json({ error: "Metoden stöds inte", code: "methodNotAllowed" }, {
       status: 405,
       headers: { Allow: "GET, HEAD" },
     });
@@ -100,7 +102,7 @@ async function handleApi(request, url, info) {
     if (!allow(`history:${client}`, 60, 60_000)) return tooManyRequests(60);
     return await handleHistory(url);
   }
-  return json({ error: "Hittades inte" }, { status: 404 });
+  return json({ error: "Hittades inte", code: "notFound" }, { status: 404 });
 }
 
 /**
@@ -114,7 +116,7 @@ async function handleSync(request, url, info) {
     (action === "stream" || action === "snapshot") &&
     model === HISTORY_MODEL;
   if (!readOnly) {
-    return json({ error: "Kurshistoriken kan bara läsas" }, {
+    return json({ error: "Kurshistoriken kan bara läsas", code: "readOnly" }, {
       status: 405,
       headers: { Allow: "GET" },
     });
@@ -155,9 +157,11 @@ async function handleQuotes(url) {
     if (result.status === "fulfilled") {
       quotes.push(result.value);
     } else {
+      const failure = upstreamFailure(result.reason, symbols[index]);
       errors.push({
         symbol: symbols[index],
-        message: friendlyUpstreamMessage(result.reason, symbols[index]),
+        code: failure.code,
+        message: failure.message,
       });
     }
   }
@@ -218,7 +222,11 @@ async function handleSearch(url) {
  */
 async function handleHistory(url) {
   const symbol = normalizeSymbol(url.searchParams.get("symbol"));
-  if (!symbol) return json({ error: "Symbol saknas" }, { status: 400 });
+  if (!symbol) {
+    return json({ error: "Symbol saknas", code: "symbolMissing" }, {
+      status: 400,
+    });
+  }
 
   try {
     const result = await ensureHistoryRow(symbol, {
@@ -232,7 +240,10 @@ async function handleHistory(url) {
     const status = error instanceof UpstreamError && error.status === 404
       ? 404
       : 502;
-    return json({ error: friendlyUpstreamMessage(error, symbol) }, { status });
+    const failure = upstreamFailure(error, symbol);
+    return json({ error: failure.message, code: failure.code, symbol }, {
+      status,
+    });
   }
 }
 
@@ -603,6 +614,7 @@ async function fetchJson(url) {
         ? "Marknadsdata svarade inte i tid"
         : "Marknadsdata kunde inte nås",
       timedOut ? 504 : 502,
+      timedOut ? "upstreamTimeout" : "upstreamUnreachable",
     );
   }
 
@@ -624,11 +636,17 @@ async function fetchJson(url) {
   }
 }
 
+/**
+ * `code` is a stable identifier the browser translates (see the `server.*`
+ * keys in public/locales); the Swedish message is the fallback text.
+ */
 class UpstreamError extends Error {
-  constructor(message, status) {
+  constructor(message, status, code) {
     super(message);
     this.name = "UpstreamError";
     this.status = status;
+    this.code = code ??
+      (status === 404 ? "noMarketData" : "upstreamUnavailable");
   }
 }
 
@@ -640,14 +658,21 @@ class RateLimitError extends Error {
   }
 }
 
-function friendlyUpstreamMessage(error, symbol) {
+/** What the client is told about a failed upstream call. */
+function upstreamFailure(error, symbol) {
   if (error instanceof UpstreamError) {
     return error.status === 404
-      ? `Hittade ingen marknadsdata för ${symbol}`
-      : error.message;
+      ? {
+        code: "noMarketData",
+        message: `Hittade ingen marknadsdata för ${symbol}`,
+      }
+      : { code: error.code, message: error.message };
   }
   console.error(error);
-  return "Marknadsdata är inte tillgänglig just nu";
+  return {
+    code: "upstreamUnavailable",
+    message: "Marknadsdata är inte tillgänglig just nu",
+  };
 }
 
 /* ---------- static files ---------- */
@@ -793,7 +818,10 @@ function clientKey(request, info) {
 }
 
 function tooManyRequests(retryAfterSeconds) {
-  return json({ error: "För många förfrågningar, försök igen om en stund." }, {
+  return json({
+    error: "För många förfrågningar, försök igen om en stund.",
+    code: "rateLimited",
+  }, {
     status: 429,
     headers: { "Retry-After": String(retryAfterSeconds) },
   });
