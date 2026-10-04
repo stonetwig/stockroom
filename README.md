@@ -96,8 +96,7 @@ tombstones.
 - Every response carries `X-Content-Type-Options`, `X-Frame-Options`,
   `Referrer-Policy`, `Permissions-Policy` and COOP/CORP headers; HTML gets a
   Content-Security-Policy that allows scripts only from the app itself and the
-  Plausible host (the Plausible bootstrap lives in `public/analytics.js` so no
-  inline script is needed). There is no wildcard CORS.
+  analytics host (`rendly.stream`). There is no wildcard CORS.
 - Upstream requests time out after 10 s, error messages never echo upstream
   bodies, and the in-memory quote/search cache is bounded.
 - Import files are validated record by record; malformed entries are skipped.
